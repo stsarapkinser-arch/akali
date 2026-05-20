@@ -17,6 +17,7 @@ COMMANDS_FILE = os.path.join(HERE, "commands.txt")
 VECTOR_CACHE_FILE = os.path.join(HERE, "vector_cache.json")
 AUTO_COMMANDS_FILE = os.path.join(HERE, "auto_commands.json")
 INDEXER_SCRIPT = os.path.join(HERE, "system_indexer.py")
+VOSK_MODEL_DIR = os.path.join(HERE, "model")
 
 # Настройки поиска (Текстовое совпадение)
 SIMILARITY_THRESHOLD = 0.70  
@@ -162,8 +163,12 @@ def load_or_build_vector_cache(commands_dict):
 
     if built > 0 or len(cache) != len(cached_vectors):
         try:
-            with open(VECTOR_CACHE_FILE, 'w', encoding='utf-8') as f:
+            # Атомарная запись: пишем в .tmp и делаем rename. Иначе
+            # Ctrl+C посреди json.dump оставит битый файл.
+            tmp_path = VECTOR_CACHE_FILE + ".tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump({"model": VECTOR_MODEL, "items": cache}, f, ensure_ascii=False)
+            os.replace(tmp_path, VECTOR_CACHE_FILE)
             print(f"💾 Кэш сохранён: переиспользовано {reused}, построено {built}, всего {len(cache)}.")
         except OSError as e:
             print(f"⚠️  Не удалось сохранить кэш: {e}")
@@ -343,8 +348,12 @@ def main():
     """Запуск аудио-цикла с авто-восстановлением при PortAudioError."""
     global model, recognizer
     print("⏳ Запуск аудио-движка (Vosk)...")
+    if not os.path.isdir(VOSK_MODEL_DIR):
+        print(f"❌ Нет каталога с Vosk-моделью: {VOSK_MODEL_DIR}")
+        print("   Скачай vosk-model-small-ru-0.22 и распакуй рядом с app.py под именем 'model'.")
+        sys.exit(1)
     try:
-        model = Model("model")
+        model = Model(VOSK_MODEL_DIR)
         recognizer = KaldiRecognizer(model, 16000)
     except Exception as e:
         print(f"❌ Ошибка Vosk: {e}")
