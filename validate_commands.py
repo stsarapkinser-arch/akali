@@ -61,11 +61,9 @@ def extract_binaries(cmd_line):
         if i >= len(tokens):
             continue
         binary = tokens[i]
-        # Уже абсолютный путь — проверяем существование
-        if "/" in binary:
-            binaries.append(binary)
-        else:
-            binaries.append(binary)
+        # Может быть абсолютный путь или просто имя — проверка существования
+        # ниже умеет работать с обоими случаями.
+        binaries.append(binary)
     return binaries
 
 
