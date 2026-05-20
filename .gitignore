@@ -1,0 +1,5 @@
+vector_cache.json
+auto_commands.json
+__pycache__/
+model/
+*.pyc
