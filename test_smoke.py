@@ -1,10 +1,13 @@
-"""Smoke-тест для app.py: проверяем парсинг commands.txt, дисковый кэш,
-fuzzy_match и cosine_similarity. Тяжёлые зависимости (ollama, vosk,
-sounddevice) подменяются фейками до импорта app.
+"""Smoke-тесты для core.backend.
 
-Запуск: python3 test_smoke.py
+Подменяем ollama (его нет на CI и в окружениях разработки), затем
+проверяем парсинг commands.txt, мёрж с auto_commands.json, дисковый
+кэш, fuzzy_match, cosine_similarity и реиндекс через subprocess.
+
+Запуск:  python3 test_smoke.py
 """
-import importlib
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -13,15 +16,13 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 
-# --- Счётчик вызовов ollama, чтобы убедиться, что кэш реально работает ---
+# --- Фейк ollama ---
 _embed_calls = {"count": 0}
 
 
 def _fake_embed(model=None, prompt=None):
     _embed_calls["count"] += 1
-    # Детерминированный «вектор» из хэша строки — для тестов важна только
-    # стабильность, не математическая корректность.
-    h = abs(hash(prompt))
+    h = abs(hash(prompt or ""))
     return {"embedding": [
         (h & 0xFF) / 255.0,
         ((h >> 8) & 0xFF) / 255.0,
@@ -30,231 +31,208 @@ def _fake_embed(model=None, prompt=None):
     ]}
 
 
-def _install_fakes():
-    fake_ollama = types.ModuleType("ollama")
-    fake_ollama.embeddings = _fake_embed
-    sys.modules["ollama"] = fake_ollama
-
-    fake_vosk = types.ModuleType("vosk")
-
-    class _FakeModel:
-        def __init__(self, *a, **kw):
-            pass
-
-    class _FakeRecognizer:
-        def __init__(self, *a, **kw):
-            pass
-
-        def AcceptWaveform(self, _b):
-            return False
-
-        def Result(self):
-            return '{"text": ""}'
-
-    fake_vosk.Model = _FakeModel
-    fake_vosk.KaldiRecognizer = _FakeRecognizer
-    fake_vosk.SetLogLevel = lambda *_a, **_kw: None
-    sys.modules["vosk"] = fake_vosk
-
-    fake_sd = types.ModuleType("sounddevice")
-
-    class _FakePortAudioError(Exception):
-        pass
-
-    class _FakeStream:
-        def __enter__(self):
-            # Сразу «нажимаем Ctrl+C» — app.py поймает KeyboardInterrupt
-            # и выйдет через sys.exit(0). Мы ловим это в _import_app().
-            raise KeyboardInterrupt
-
-        def __exit__(self, *_a):
-            return False
-
-    fake_sd.PortAudioError = _FakePortAudioError
-    fake_sd.RawInputStream = lambda **_kw: _FakeStream()
-    sys.modules["sounddevice"] = fake_sd
+def _install_fake_ollama():
+    fake = types.ModuleType("ollama")
+    fake.embeddings = _fake_embed
+    sys.modules["ollama"] = fake
 
 
-def _reset_app():
-    """Удаляем app из sys.modules и счётчик, чтобы прогнать импорт заново."""
-    sys.modules.pop("app", None)
+def _reset():
     _embed_calls["count"] = 0
+    for name in list(sys.modules):
+        if name.startswith("core.") or name == "core":
+            sys.modules.pop(name, None)
 
 
-def _import_app():
-    """Импортируем app. Аудио-цикл гейтится через if __name__ == '__main__',
-    поэтому импорт ничего не запускает и не блокирует."""
-    import app  # noqa: F401
-    return sys.modules["app"]
+def _load_core():
+    """Импортирует core.backend с уже установленным фейком ollama."""
+    from core.backend import AssistantCore  # noqa: WPS433
+    return AssistantCore(base_dir=HERE)
 
 
+# ============================================================
 def main():
+    _install_fake_ollama()
+
+    # Чистим артефакты предыдущих прогонов
+    for fname in ("vector_cache.json", "auto_commands.json"):
+        path = os.path.join(HERE, fname)
+        if os.path.exists(path):
+            os.remove(path)
+
+    # ============================================================
+    # Тест 1: первая сборка строит и сохраняет кэш
+    # ============================================================
+    _reset()
+    _embed_calls["count"] = 0
+    core = _load_core()
+    stats1 = core.reload()
+    assert stats1.vector_total > 0, "первая сборка не дала ни одного вектора"
+    assert _embed_calls["count"] == stats1.vector_total, \
+        f"ожидали {stats1.vector_total} вызовов ollama, было {_embed_calls['count']}"
+    assert os.path.exists(core.vector_cache_file), "кэш не сохранился на диск"
+    print(f"[1] Первая сборка: {stats1.vector_total} векторов, {_embed_calls['count']} вызовов ollama.")
+
+    # ============================================================
+    # Тест 2: второй прогон — полное попадание в кэш, 0 вызовов
+    # ============================================================
+    _reset()
+    _embed_calls["count"] = 0
+    core2 = _load_core()
+    stats2 = core2.reload()
+    assert stats2.vector_total == stats1.vector_total, "размер кэша расходится"
+    assert _embed_calls["count"] == 0, \
+        f"второй прогон должен попасть в кэш, было {_embed_calls['count']} вызовов"
+    print(f"[2] Кэш-хит: 0 вызовов ollama на {stats2.vector_total} векторов.")
+
+    # ============================================================
+    # Тест 3: смена векторной модели инвалидирует кэш
+    # ============================================================
+    _reset()
+    _embed_calls["count"] = 0
+    core3 = _load_core()
+    core3.vector_model = "totally-different-model"
+    stats3 = core3.reload()
+    assert _embed_calls["count"] == stats3.vector_total, \
+        "смена модели должна форсировать пересчёт всех векторов"
+    print(f"[3] Смена модели → {_embed_calls['count']} новых эмбеддингов.")
+
+    # ============================================================
+    # Тест 4: битый JSON → восстанавливается, не падает
+    # ============================================================
     cache_path = os.path.join(HERE, "vector_cache.json")
-    if os.path.exists(cache_path):
-        os.remove(cache_path)
-
-    _install_fakes()
-
-    # Чистим auto_commands.json от предыдущих прогонов, чтобы тест был воспроизводим
-    auto_path = os.path.join(HERE, "auto_commands.json")
-    if os.path.exists(auto_path):
-        os.remove(auto_path)
-
-    # --- 1-й запуск: кэш отсутствует, все триггеры эмбеддятся заново ---
-    _reset_app()
-    app = _import_app()
-
-    assert os.path.exists(cache_path), "Кэш-файл должен создаться после первого запуска"
-    with open(cache_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    assert payload["model"] == app.VECTOR_MODEL, "В кэше должна быть записана модель"
-    total_triggers = sum(len(t) for t in app.commands_db.values())
-    assert len(payload["items"]) == total_triggers, (
-        f"В кэше {len(payload['items'])} векторов, ожидали {total_triggers}"
-    )
-    first_run_calls = _embed_calls["count"]
-    assert first_run_calls == total_triggers, (
-        f"Первый запуск должен звать ollama ровно {total_triggers} раз, было {first_run_calls}"
-    )
-    print(f"[1] Первый запуск: построено {first_run_calls} векторов, кэш сохранён.")
-
-    # --- 2-й запуск: кэш должен полностью переиспользоваться (0 вызовов ollama) ---
-    _reset_app()
-    importlib.invalidate_caches()
-    app2 = _import_app()
-
-    assert _embed_calls["count"] == 0, (
-        f"При полном попадании в кэш ollama звать НЕ должны, было {_embed_calls['count']}"
-    )
-    assert len(app2.vector_cache) == total_triggers
-    print(f"[2] Второй запуск: 0 вызовов ollama, переиспользовано {len(app2.vector_cache)} векторов.")
-
-    # --- 3-й запуск: меняем модель в кэше, ждём полной инвалидации ---
-    with open(cache_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    payload["model"] = "some-old-model"
     with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
+        f.write("{not_a_json::")
+    _reset()
+    _embed_calls["count"] = 0
+    core4 = _load_core()
+    stats4 = core4.reload()
+    assert stats4.vector_total > 0, "после битого JSON всё ещё должны построить кэш"
+    assert _embed_calls["count"] == stats4.vector_total, \
+        "после битого JSON должны пересчитать все векторы"
+    print(f"[4] Битый JSON → восстановили {_embed_calls['count']} векторов.")
 
-    _reset_app()
-    app3 = _import_app()
+    # ============================================================
+    # Тест 5: fuzzy_match находит точные триггеры
+    # ============================================================
+    _reset()
+    _embed_calls["count"] = 0
+    core5 = _load_core()
+    core5.reload()
+    # У нас в commands.txt должно быть "скрыть окно" → qdbus invokeShortcut Window Minimize
+    m = core5.fuzzy_match("скрыть окно")
+    assert m.found, f"fuzzy_match не нашёл 'скрыть окно' (max={m.confidence:.2f})"
+    assert "qdbus" in m.cmd or "kglobalaccel" in m.cmd, \
+        f"ожидали qdbus-команду, было: {m.cmd}"
+    print(f"[5] fuzzy «скрыть окно» → {m.cmd[:40]}…  ({m.confidence:.2f})")
 
-    assert _embed_calls["count"] == total_triggers, (
-        "Смена модели должна инвалидировать весь кэш"
-    )
-    print(f"[3] Смена модели: кэш пересобран ({_embed_calls['count']} вызовов).")
+    # ============================================================
+    # Тест 6: cosine_similarity
+    # ============================================================
+    from core.backend import AssistantCore as AC
+    assert AC.cosine_similarity([1, 0, 0], [1, 0, 0]) == 1.0
+    assert AC.cosine_similarity([1, 0, 0], [0, 1, 0]) == 0.0
+    assert AC.cosine_similarity([], [1, 2, 3]) == 0.0
+    assert AC.cosine_similarity([0, 0, 0], [1, 2, 3]) == 0.0
+    print("[6] cosine_similarity ок (1.0, 0.0, граничные).")
 
-    # --- 4-й запуск: повреждаем кэш-файл, ждём аккуратного fallback ---
-    with open(cache_path, "w", encoding="utf-8") as f:
-        f.write("{not valid json")
+    # ============================================================
+    # Тест 7: миграция xdotool → qdbus прошла, в базе хватает qdbus-команд
+    # ============================================================
+    qdbus_cmds = [c for c in core5.commands_db.keys() if "qdbus" in c]
+    assert len(qdbus_cmds) >= 4, \
+        f"qdbus-команд должно быть не меньше 4, нашли {len(qdbus_cmds)}"
+    print(f"[7] В базе {len(qdbus_cmds)} qdbus-команд — миграция xdotool применена.")
 
-    _reset_app()
-    app4 = _import_app()
+    # ============================================================
+    # Тест 8: API AssistantCore содержит все обещанные методы
+    # ============================================================
+    required = ("reload", "fuzzy_match", "vector_search", "find",
+                "build_commands_db", "load_or_build_vector_cache",
+                "execute", "reindex_system", "detect_wake_word",
+                "is_reindex_phrase")
+    for name in required:
+        assert hasattr(AC, name), f"AssistantCore.{name} отсутствует"
+    print(f"[8] API AssistantCore: все {len(required)} методов на месте.")
 
-    assert _embed_calls["count"] == total_triggers, "Битый кэш — пересобираем всё"
-    assert os.path.exists(cache_path) and os.path.getsize(cache_path) > 100
-    print(f"[4] Битый кэш: восстановлен ({_embed_calls['count']} вызовов).")
-
-    # --- Проверка fuzzy_match и cosine_similarity ---
-    # Берём первый триггер первой команды и подсовываем его как пользовательский ввод.
-    first_cmd = next(iter(app4.commands_db.keys()))
-    first_trigger = app4.commands_db[first_cmd][0]
-    matched, ratio = app4.fuzzy_match(first_trigger, app4.commands_db)
-    assert matched == first_cmd, f"fuzzy_match должен попасть в {first_cmd}, попал в {matched}"
-    assert ratio >= 0.99, f"Точное совпадение должно дать ratio≈1.0, было {ratio}"
-    print(f"[5] fuzzy_match: '{first_trigger}' -> {matched} (ratio={ratio:.2f})")
-
-    v1 = [1.0, 0.0, 0.0]
-    v2 = [1.0, 0.0, 0.0]
-    v3 = [0.0, 1.0, 0.0]
-    assert abs(app4.cosine_similarity(v1, v2) - 1.0) < 1e-9
-    assert abs(app4.cosine_similarity(v1, v3) - 0.0) < 1e-9
-    assert app4.cosine_similarity([], v1) == 0.0
-    assert app4.cosine_similarity([0.0, 0.0], [0.0, 0.0]) == 0.0
-    print("[6] cosine_similarity: identical=1.0, orthogonal=0.0, edge cases OK.")
-
-    # --- Парсер commands.txt: убеждаемся, что qdbus-строки распарсились ---
-    qdbus_cmds = [c for c in app4.commands_db if c.startswith("qdbus")]
-    assert len(qdbus_cmds) >= 4, f"Должно быть ≥4 qdbus-команд, нашли {len(qdbus_cmds)}"
-    minimize = [c for c in qdbus_cmds if "Window Minimize" in c]
-    assert minimize, "Не нашли qdbus-команду свернуть окно"
-    print(f"[7] commands.txt: {len(qdbus_cmds)} qdbus-команд, миграция xdotool->qdbus прошла.")
-
-    # --- attempt_audio_recovery / build_commands_db / reindex_system живы ---
-    assert callable(app4.attempt_audio_recovery), "attempt_audio_recovery отсутствует"
-    assert callable(app4.reindex_system), "reindex_system отсутствует"
-    assert callable(app4.build_commands_db), "build_commands_db отсутствует"
-    # Авто-индекс отсутствует — база равна curated.
-    assert app4.load_auto_commands() == {}
-    print("[8] Новые функции (audio-recovery / reindex / build_commands_db) на месте.")
-
-    # --- Мерж auto+curated: пишем фейковый auto_commands.json и проверяем объединение ---
-    fake_auto = {
+    # ============================================================
+    # Тест 9: мёрж auto+curated с приоритетом curated
+    # ============================================================
+    # Готовим auto_commands.json с пересекающейся командой
+    auto_payload = {
         "version": 1,
-        "generated_at": "2026-05-20T00:00:00+00:00",
         "sources": {"desktop": 1, "kwin": 0, "binary": 0},
         "items": [
-            {"command": "konsole &", "trigger": "второй синоним для konsole", "source": "desktop"},
-            {"command": "xeyes &", "trigger": "покажи глаза", "source": "desktop"},
+            # Совпадает с curated: должна перебиться curated триггерами
+            {"command": "firefox-esr &", "trigger": "auto-trigger-firefox"},
+            # Уникальная auto-команда
+            {"command": "echo auto-only-cmd &", "trigger": "уникальный авто триггер"},
         ],
     }
+    auto_path = os.path.join(HERE, "auto_commands.json")
     with open(auto_path, "w", encoding="utf-8") as f:
-        json.dump(fake_auto, f, ensure_ascii=False)
-    _reset_app()
-    if os.path.exists(cache_path):
-        os.remove(cache_path)
-    app5 = _import_app()
-    # Новая команда из auto должна появиться
-    assert "xeyes &" in app5.commands_db
-    assert "покажи глаза" in app5.commands_db["xeyes &"]
-    # При конфликте «konsole &» (она в commands.txt) curated приоритетнее, но auto-триггер
-    # должен быть в конце списка.
-    konsole_triggers = app5.commands_db["konsole &"]
-    assert "второй синоним для konsole" in konsole_triggers
-    assert konsole_triggers[0] != "второй синоним для konsole", "curated должен быть первым"
-    print(f"[9] Мерж auto+curated: {len(app5.commands_db)} команд (+2 из auto), приоритет curated.")
+        json.dump(auto_payload, f, ensure_ascii=False)
 
-    # --- attempt_audio_recovery не должен падать на отсутствии systemctl/pulseaudio ---
-    # Просто вызываем и убеждаемся, что вернётся без исключения.
-    # Патчим time.sleep в app, чтобы не ждать 2 сек.
-    original_sleep = app5.time.sleep
-    app5.time.sleep = lambda *_a, **_kw: None
+    _reset()
+    _embed_calls["count"] = 0
+    core9 = _load_core()
+    stats9 = core9.reload()
+    assert "echo auto-only-cmd &" in core9.commands_db, "уникальная auto-команда не попала в базу"
+    assert "firefox-esr &" in core9.commands_db, "curated команда исчезла после мёржа"
+    triggers = core9.commands_db["firefox-esr &"]
+    assert triggers[0] != "auto-trigger-firefox", \
+        f"первым должен идти curated-триггер, а не auto ({triggers[:3]})"
+    assert "auto-trigger-firefox" in triggers, "auto-триггер должен добавиться в хвост"
+    print(f"[9] Мёрж: {stats9.commands_total} команд (curated={stats9.curated_count}, "
+          f"auto={stats9.auto_count}), curated приоритет ок.")
+    os.remove(auto_path)
+
+    # ============================================================
+    # Тест 10: reindex_system дёргает system_indexer.py (подменим на echo)
+    # ============================================================
+    _reset()
+    core10 = _load_core()
+    core10.reload()
+    # Подменяем путь к скрипту на маленький фейковый, который создаёт пустой auto_commands.json
+    fake_script = os.path.join(HERE, "_fake_indexer.py")
+    with open(fake_script, "w", encoding="utf-8") as f:
+        f.write(
+            "import json, os\n"
+            "p = os.path.join(os.path.dirname(__file__), 'auto_commands.json')\n"
+            "with open(p, 'w', encoding='utf-8') as fp:\n"
+            "    json.dump({'version': 1, 'sources': {'desktop': 0}, 'items': []}, fp)\n"
+        )
     try:
-        app5.attempt_audio_recovery()
+        core10.indexer_script = fake_script
+        res = core10.reindex_system(timeout=10)
+        assert res["ok"], f"reindex не отработал: {res}"
+        assert res["stats"] is not None, "stats должен быть заполнен"
+        print(f"[10] reindex_system: subprocess + reload отработали ок.")
     finally:
-        app5.time.sleep = original_sleep
-    print("[10] attempt_audio_recovery() отработал без исключений (игнорировал отсутствующие бинари).")
+        if os.path.exists(fake_script):
+            os.remove(fake_script)
+        # Удаляем артефакт фейкового индекса
+        if os.path.exists(auto_path):
+            os.remove(auto_path)
 
-    # --- Реиндексация на лету: подменяем subprocess.run, убеждаемся, что вызывается ---
-    captured = {}
-    original_run = app5.subprocess.run
+    # ============================================================
+    # Тест 11: detect_wake_word и is_reindex_phrase
+    # ============================================================
+    _reset()
+    core11 = _load_core()
+    core11.reload()
+    assert core11.detect_wake_word(["акали", "открой", "браузер"]) == 0
+    assert core11.detect_wake_word(["открой", "ассистент", "браузер"]) == 1
+    assert core11.detect_wake_word(["просто", "команда"]) == -1
+    assert core11.is_reindex_phrase("переиндексируй систему")
+    assert core11.is_reindex_phrase("обнови команды пожалуйста")
+    assert not core11.is_reindex_phrase("открой браузер")
+    print("[11] detect_wake_word + is_reindex_phrase ок.")
 
-    def _fake_run(args, **kwargs):
-        captured["args"] = args
-        # Ничего не меняем, имитируем успех
-        class _R:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-        return _R()
-
-    app5.subprocess.run = _fake_run
-    try:
-        app5.reindex_system()
-    finally:
-        app5.subprocess.run = original_run
-    assert "args" in captured, "reindex_system не вызвал subprocess.run"
-    assert any("system_indexer" in str(a) for a in captured["args"]), \
-        f"reindex_system должен был вызвать system_indexer, вызвал: {captured['args']}"
-    print("[11] reindex_system() корректно зовёт system_indexer.py.")
-
-    # --- Чистим за собой ---
-    if os.path.exists(cache_path):
-        os.remove(cache_path)
-    if os.path.exists(auto_path):
-        os.remove(auto_path)
-    print("\nВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ✓")
+    print()
+    print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ✓")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

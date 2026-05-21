@@ -1,16 +1,18 @@
-# Akali — голосовой ассистент для Kali Linux
+# Akali — голосовой ассистент для Kali Linux / KDE Plasma 6
 
-Локальный (offline) ассистент: распознаёт голос через Vosk, ищет команду
-из базы через difflib + векторные эмбеддинги (Ollama / all-minilm) и
-выполняет через `bash`. Облачные API не используются — всё работает на
-Intel N100 без перегрева.
+Локальный (offline) ассистент с **GUI на PySide6**, системным треем и
+встроенным авто-обновлением из git. Распознаёт голос через Vosk, ищет
+команду из объединённой базы (curated + авто-индекс системы) с помощью
+fuzzy- и векторного поиска (Ollama / all-minilm), выполняет через
+`bash`. Облачные API не используются — всё на Intel N100 без перегрева.
 
 ## Стек
 
 | Компонент   | Технология                                     |
 |-------------|------------------------------------------------|
 | Платформа   | Kali Linux + KDE Plasma 6 (Wayland)            |
-| Язык        | Python 3.13+                                   |
+| Язык        | Python 3.10+                                   |
+| GUI         | [PySide6](https://wiki.qt.io/Qt_for_Python) (Qt 6)|
 | STT         | [vosk](https://alphacephei.com/vosk/) (`vosk-model-small-ru-0.22`) |
 | Аудио       | [sounddevice](https://python-sounddevice.readthedocs.io/) (PipeWire / PulseAudio) |
 | Эмбеддинги  | [ollama](https://ollama.com/) (модель `all-minilm`) |
@@ -19,19 +21,26 @@ Intel N100 без перегрева.
 ## Архитектура
 
 ```
-голос → Vosk → текст
-                  │
-                  ▼
-        ┌─── Wake Word? ──── нет ──── игнор
-        │   (Акали/Ассистент/Компьютер, 5-сек окно)
-        │
-        ▼ да
-   ┌──── Fuzzy match (difflib, порог 0.70) ──── найдено ──── ►
-   │                                                          │
-   │ нет                                                      ▼
-   ▼                                                       Запуск
-   Vector match (cosine_similarity, порог 0.55)              │
-   с эмбеддингами из vector_cache.json ────────► найдено ────┘
+                ┌──────────────────────────────┐
+                │      QApplication (UI)       │
+                │  ┌─────────┐  ┌────────────┐ │
+                │  │ MainWin │  │ TrayIcon   │ │
+                │  └────┬────┘  └──────┬─────┘ │
+                └───────┼──────────────┼──────┘
+                  signals│              │signals
+                ┌────────▼──────────────▼────────┐
+                │  AkaliApp (координатор)         │
+                └────────┬────────────────────────┘
+                         │
+        ┌────────────────┼─────────────────┐
+        ▼                ▼                 ▼
+   ┌──────────┐   ┌──────────────┐   ┌──────────┐
+   │AudioWorkr│   │AssistantCore │   │UpdateRunr│
+   │(QThread) │   │(база+поиск)  │   │(git pull)│
+   └─────┬────┘   └──────────────┘   └──────────┘
+         │ микрофон+Vosk
+         ▼
+   bash subprocess
 ```
 
 База команд собирается из **двух источников**:
@@ -41,46 +50,64 @@ Intel N100 без перегрева.
    (см. `system_indexer.py`).
 
 При совпадении команды в обоих источниках приоритет у `commands.txt`,
-но синонимы из авто-индекса дополняют список триггеров.
+синонимы из авто-индекса дополняют список триггеров.
 
 ## Файлы
 
-| Файл                      | Назначение |
+| Файл / Папка              | Назначение |
 |---------------------------|------------|
-| `app.py`                  | Основной движок: STT → поиск → выполнение |
+| `akali.py`                | Entry point (`python3 akali.py`) |
+| `core/backend.py`         | Чистая логика: база, поиск, выполнение, реиндекс |
+| `core/audio_worker.py`    | QThread: микрофон + Vosk + recovery |
+| `core/updater.py`         | git pull в фоне |
+| `ui/main_window.py`       | Главное окно (4 вкладки) |
+| `ui/tray.py`              | Системный трей |
+| `ui/styles.qss`           | Тёмная тема |
+| `assets/icon.svg`         | Иконка приложения |
+| `akali.desktop`           | Шаблон .desktop-файла для KDE-меню |
 | `commands.txt`            | Ручная база команд (188 команд / 450 триггеров) |
 | `system_indexer.py`       | Авто-индексатор системы (`.desktop` + KWin + `$PATH`) |
 | `auto_commands.json`      | Результат работы индексатора (генерируется) |
 | `vector_cache.json`       | Дисковый кэш эмбеддингов (генерируется) |
 | `validate_commands.py`    | Проверяет наличие всех бинарей из `commands.txt` |
-| `test_smoke.py`           | 11 unit-тестов без внешних зависимостей |
+| `test_smoke.py`           | 11 smoke-тестов без микрофона/ollama/Vosk |
+| `requirements.txt`        | Список python-зависимостей |
 
 ## Установка
 
 ```bash
-# 1. Зависимости
+# 1. Системные пакеты (под Kali)
 sudo apt update
-sudo apt install -y python3-pip portaudio19-dev qdbus-qt6 konsole pipewire-pulse
-pip3 install --user vosk sounddevice ollama
+sudo apt install -y python3-pip portaudio19-dev qt6-tools konsole pipewire-pulse
 
-# 2. Ollama + модель эмбеддингов
+# 2. Python-зависимости
+pip3 install --user -r requirements.txt
+
+# 3. Ollama + модель эмбеддингов
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull all-minilm
 
-# 3. Vosk-модель для русского
+# 4. Vosk-модель для русского
 wget https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip
 unzip vosk-model-small-ru-0.22.zip && mv vosk-model-small-ru-0.22 model
 
-# 4. Проверка: какие бинари из commands.txt установлены
-python3 validate_commands.py
+# 5. (Опционально) проиндексировать систему
+python3 system_indexer.py            # GUI-приложения + KWin (быстро)
+python3 system_indexer.py --binaries # + $PATH (медленнее, шумнее)
 
-# 5. (Опционально) проиндексировать всю систему — добавит ~200+ команд
-python3 system_indexer.py            # только GUI + KWin
-python3 system_indexer.py --binaries # + $PATH (медленнее)
-
-# 6. Старт
-python3 app.py
+# 6. Старт GUI
+python3 akali.py
 ```
+
+После запуска приложение живёт **в системном трее**. По клику на иконку
+открывается главное окно с четырьмя вкладками:
+
+- **🏠 Главная** — большой статус, уровень микрофона, история команд, кнопки.
+- **📚 Команды** — поиск по всей базе (curated + auto), хеппинг с триггерами.
+- **⚙ Настройки** — пороги fuzzy/vector/wake, wake-words, путь к репо, **«Обновить из репо»**.
+- **📜 Лог** — потоковый журнал всех событий (распознанные фразы, ошибки, ответы команд).
+
+Меню в трее: Слушать/Стоп, Переиндексировать, Обновить из репо, Показать окно, Выход.
 
 ## Использование
 
@@ -94,39 +121,79 @@ python3 app.py
 Доступные wake-words: **Акали**, **Ассистент**, **Компьютер**.
 После активации даётся 5 секунд на следующую команду.
 
+## Обновление из репо
+
+В Настройках → «Обновить из репо (git pull)» (или в трей-меню).
+Под капотом:
+1. Проверяем, что директория — git-репо.
+2. Проверяем чистый working tree.
+3. `git fetch --prune` + `git pull --ff-only`.
+4. Показываем список новых коммитов и изменённых файлов.
+5. Если изменились `.py` или `.qss` — предупреждаем о необходимости перезапуска.
+
+Force-merge не делаем, поэтому если у тебя есть локальные правки —
+обновление откажется и попросит разрулить вручную.
+
+## Регистрация в KDE-меню (опционально)
+
+```bash
+# 1. Подставь свой реальный путь
+sed "s|%CHANGE_ME_TO_AKALI_PATH%|$HOME/akali|g" akali.desktop > ~/.local/share/applications/akali.desktop
+
+# 2. Скопируй иконку
+mkdir -p ~/.local/share/icons/hicolor/scalable/apps
+cp assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/akali.svg
+
+# 3. Обнови кэш меню
+kbuildsycoca6 2>/dev/null || kbuildsycoca5
+```
+
+После этого Akali появится в KDE-меню «Утилиты».
+
 ## Тесты
 
 ```bash
 python3 test_smoke.py
-# 11 проверок: кэш, fuzzy/vector матчинг, audio-recovery, мерж auto+curated
+# 11 проверок: кэш, fuzzy/vector матчинг, audio-recovery API,
+# мёрж auto+curated, реиндекс через subprocess, wake-word логика.
 ```
 
-## Что нового в этой ветке
+Тесты подменяют `ollama` фейком, поэтому не требуют ни сети, ни ollama
+вживую.
 
-- **Авто-восстановление аудио**: при `PortAudioError` пробуем перезапустить
-  PipeWire / PulseAudio автоматически (5 попыток с экспоненциальным backoff)
-  вместо немедленного падения.
-- **`system_indexer.py`** — собирает базу из `.desktop`-файлов,
-  KWin-шорткатов и (опционально) `$PATH`. Русские имена для приложений
-  берутся из `Name[ru]` / `GenericName[ru]` / `Comment[ru]` бесплатно.
-- **Голосовая команда «переиндексируй»** перезапускает индексатор
-  и пересобирает кэш без рестарта `app.py`.
-- **`commands.txt`** расширен с 50 до 188 команд:
-  тайлинг окон, виртуальные столы, `pactl`, `playerctl`, скриншоты через
-  `spectacle`, DNS-диагностика, Wi-Fi, пентест-арсенал
-  (recon / web / SMB-AD / wireless / crypto / anonymity).
-- **xdotool → qdbus**: все оконные операции переведены на KWin shortcuts
-  (xdotool не работает на Wayland).
-- **Дисковый кэш эмбеддингов** (`vector_cache.json`) с инкрементальной
-  достройкой и инвалидацией по версии модели.
-- **TUI-команды** (`htop`, `msfconsole`, `wifite`, `setoolkit`)
-  обёрнуты в `konsole -e …`, иначе они не отображаются.
+## Что нового
+
+### GUI (PySide6 + tray)
+- Полноценное desktop-приложение вместо CLI.
+- Тёмная тема, системный трей, 4 вкладки.
+- Авто-обновление из репо одной кнопкой.
+- Все настройки (пороги, wake-words, пути) персистентны через `QSettings`.
+
+### Авто-индексация системы
+- `system_indexer.py` собирает базу из `.desktop`-файлов
+  (`Name[ru]`/`Comment[ru]` тащит бесплатно), KWin-шорткатов
+  (`qdbus`/`qdbus6`/`qdbus-qt6` авто-detection) и опционально `$PATH`.
+- Голосовая команда «переиндексируй» перезапускает индексатор и
+  пересобирает векторный кэш без остановки приложения.
+
+### Аудио-recovery
+- При `PortAudioError` ассистент пробует перезапустить
+  PipeWire/PulseAudio автоматически (5 попыток с экспоненциальным
+  backoff) вместо немедленного падения.
+
+### Wayland-совместимость
+- `xdotool → qdbus` (KWin shortcuts). Все оконные операции работают
+  на Wayland.
+- TUI-команды (`htop`, `msfconsole`, `wifite`) обёрнуты в `konsole -e …`.
+
+### Дисковый кэш эмбеддингов
+- `vector_cache.json` с инкрементальной достройкой и инвалидацией по
+  имени модели. Атомарная запись через `.tmp` + `os.replace`.
 
 ## Roadmap
 
-- inotify-watch на `/usr/share/applications/` → автоматический реиндекс
-  при `apt install`.
-- TTS (espeak-ng / piper-tts) для голосовой обратной связи.
-- Простой «вопрос-ответ» режим: «что такое X» → `whatis X`, «где живёт X»
-  → `which X`.
-- Pexpect-обёртка для интерактивных консольных команд.
+- inotify-watch на `/usr/share/applications/` → авто-реиндекс после `apt install`.
+- TTS-ответ (`espeak-ng` или `piper-tts`).
+- Q&A-режим: «что такое X» → `whatis X`, «где живёт X» → `which X`.
+- Визуальный selector аудио-устройств в Настройках.
+- Pexpect-обвязка для интерактивных команд (apt с подтверждением и т.п.).

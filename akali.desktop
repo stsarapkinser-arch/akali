@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Akali
+Name[ru]=Акали
+GenericName=Voice Assistant
+GenericName[ru]=Голосовой ассистент
+Comment=Local voice assistant for KDE/Kali (vosk + ollama + KWin)
+Comment[ru]=Локальный голосовой ассистент для KDE/Kali
+Exec=sh -c "cd %CHANGE_ME_TO_AKALI_PATH% && python3 akali.py"
+Icon=%CHANGE_ME_TO_AKALI_PATH%/assets/icon.svg
+Terminal=false
+Categories=Utility;Accessibility;
+StartupNotify=true
+Keywords=voice;assistant;vosk;kde;kali;
