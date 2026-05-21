@@ -1,22 +1,21 @@
-"""Главный экран: статус, центральный реактор, нижняя строка статусов.
+"""Главный экран: компактный, в стиле Jarvis-виджета.
 
-Раскладка (схематично):
+Раскладка (для окна ~400×720):
 
-    ┌────────────────────────────────────────────────┐
-    │                                                │
-    │   [статус-бейдж]                       [текст] │
-    │                                                │
-    │                                                │
-    │               ┌──── REACTOR ────┐              │
-    │               │                 │              │
-    │               │      core       │              │
-    │               │                 │              │
-    │               └─────────────────┘              │
-    │                                                │
-    │      [старт/стоп]    [переиндексировать]       │
-    │                                                │
-    │   🟢 Микрофон   🟡 Нейросети   🔵 Ресурсы      │
-    └────────────────────────────────────────────────┘
+    ┌──── 400 wide ─────┐
+    │ [statusBadge]     │  верхняя строка
+    │                   │
+    │   ┌─ reactor ─┐   │
+    │   │  240×240  │   │
+    │   └───────────┘   │
+    │      СЛУШАЮ       │  bigStatus
+    │   Скажите Акали   │  hint
+    │                   │
+    │   ┌── SЛУШАТЬ ──┐ │  primary
+    │   ┌─Переиндекс─┐  │  secondary
+    │                   │
+    │   « последняя »   │  spokenText
+    └───────────────────┘
 """
 from __future__ import annotations
 
@@ -24,7 +23,7 @@ from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
                                 QSizePolicy, QVBoxLayout, QWidget)
 
-from ..widgets import Reactor, StatusRow
+from ..widgets import Reactor
 
 
 STATE_TEXT = {
@@ -32,26 +31,26 @@ STATE_TEXT = {
     "listening":        "Слушаю",
     "waiting_command":  "Жду команду",
     "processing":       "Выполняю",
-    "reindexing":       "Реиндексирую систему",
-    "recovering":       "Восстанавливаю аудио",
-    "stopped":          "Готов к работе",
+    "reindexing":       "Реиндекс",
+    "recovering":       "Восстанавливаю",
+    "stopped":          "Готов",
     "error":            "Ошибка",
 }
 
 STATE_HINT = {
     "starting":         "Загружаю Vosk и подключаю микрофон…",
     "listening":        "Скажите «Акали» и команду",
-    "waiting_command":  "Произнесите команду в течение 5 секунд",
-    "processing":       "Команда найдена, запускаю…",
+    "waiting_command":  "Произнесите команду…",
+    "processing":       "Команда найдена, запускаю",
     "reindexing":       "Сканирую `.desktop` и KWin",
-    "recovering":       "Перезапускаю PipeWire / PulseAudio",
-    "stopped":          "Нажмите «Слушать», чтобы активировать ассистент",
+    "recovering":       "Перезапуск PipeWire / PulseAudio",
+    "stopped":          "Нажмите «Слушать», чтобы активировать",
     "error":            "См. вкладку «Лог»",
 }
 
 
 class HomePage(QWidget):
-    """Экран ассистента в стиле Iron-Man / Jarvis."""
+    """Экран ассистента: реактор + большая кнопка + статус."""
 
     start_clicked = Signal()
     stop_clicked = Signal()
@@ -67,33 +66,32 @@ class HomePage(QWidget):
     # ── Сборка ────────────────────────────────────────────────────────
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(20, 8, 20, 16)
-        outer.setSpacing(8)
+        outer.setContentsMargins(16, 8, 16, 12)
+        outer.setSpacing(6)
 
-        # === Верхняя строка: бейдж статуса слева, hint справа =========
+        # Бейдж статуса — узкая полоска сверху
         top = QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(0)
+        top.addStretch(1)
         self._badge = QLabel("Готов")
         self._badge.setObjectName("statusBadge")
+        self._badge.setAlignment(Qt.AlignCenter)
         top.addWidget(self._badge)
         top.addStretch(1)
-        self._spoken = QLabel("")
-        self._spoken.setObjectName("spokenText")
-        self._spoken.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        top.addWidget(self._spoken)
         outer.addLayout(top)
 
-        # === Центральный реактор ====================================
+        # ── Центральный реактор ──
         center = QHBoxLayout()
         center.addStretch(1)
         self._reactor = Reactor()
-        self._reactor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._reactor.setMinimumSize(360, 360)
+        self._reactor.setMinimumSize(240, 240)
+        self._reactor.setMaximumSize(280, 280)
+        self._reactor.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         center.addWidget(self._reactor, 0, Qt.AlignHCenter)
         center.addStretch(1)
-        outer.addLayout(center, 1)
+        outer.addLayout(center)
 
-        # Подпись под реактором
+        # Большая надпись + подсказка
         self._state_text = QLabel("")
         self._state_text.setObjectName("bigStatus")
         self._state_text.setAlignment(Qt.AlignHCenter)
@@ -102,36 +100,41 @@ class HomePage(QWidget):
         self._hint = QLabel("")
         self._hint.setObjectName("hint")
         self._hint.setAlignment(Qt.AlignHCenter)
+        self._hint.setWordWrap(True)
         outer.addWidget(self._hint)
 
-        # === Кнопки управления ======================================
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-        btn_row.addStretch(1)
+        outer.addSpacing(6)
+
+        # Главная кнопка — на всю ширину
         self._btn_listen = QPushButton("Слушать")
         self._btn_listen.setObjectName("primaryBtn")
-        self._btn_listen.setMinimumWidth(160)
         self._btn_listen.setCursor(Qt.PointingHandCursor)
+        self._btn_listen.setMinimumHeight(40)
         self._btn_listen.clicked.connect(self._on_listen_clicked)
-        btn_row.addWidget(self._btn_listen)
+        outer.addWidget(self._btn_listen)
 
+        # Вторичная — реиндекс
         self._btn_reindex = QPushButton("Переиндексировать")
         self._btn_reindex.setObjectName("secondaryBtn")
         self._btn_reindex.setCursor(Qt.PointingHandCursor)
+        self._btn_reindex.setMinimumHeight(32)
         self._btn_reindex.clicked.connect(self.reindex_clicked.emit)
-        btn_row.addWidget(self._btn_reindex)
-        btn_row.addStretch(1)
-        outer.addLayout(btn_row)
+        outer.addWidget(self._btn_reindex)
 
-        # === Нижняя строка статусов =================================
-        outer.addSpacing(4)
-        separator = QFrame()
-        separator.setObjectName("homeSeparator")
-        separator.setFrameShape(QFrame.HLine)
-        outer.addWidget(separator)
+        outer.addStretch(1)
 
-        self._status_row = StatusRow()
-        outer.addWidget(self._status_row)
+        # Лента «последнее распознано» внизу
+        sep = QFrame()
+        sep.setObjectName("homeSeparator")
+        sep.setFrameShape(QFrame.HLine)
+        outer.addWidget(sep)
+
+        self._spoken = QLabel("")
+        self._spoken.setObjectName("spokenText")
+        self._spoken.setWordWrap(True)
+        self._spoken.setAlignment(Qt.AlignHCenter)
+        self._spoken.setMinimumHeight(28)
+        outer.addWidget(self._spoken)
 
     # ── Внешний API ───────────────────────────────────────────────────
     @Slot(float)
@@ -155,16 +158,20 @@ class HomePage(QWidget):
 
     @Slot(str)
     def show_spoken(self, text: str) -> None:
+        # Ограничиваем длину, чтобы не разрывало раскладку
+        if len(text) > 64:
+            text = text[:61] + "…"
         self._spoken.setText(f"«{text}»")
 
-    def set_mic_subtitle(self, text: str) -> None:
-        self._status_row.mic.set_subtitle(text)
+    # Заглушки чтобы внешний код мог звать их даже без status_row
+    def set_mic_subtitle(self, _text: str) -> None:
+        pass
 
-    def set_brain_subtitle(self, text: str) -> None:
-        self._status_row.brain.set_subtitle(text)
+    def set_brain_subtitle(self, _text: str) -> None:
+        pass
 
-    def set_resources_subtitle(self, text: str) -> None:
-        self._status_row.resources.set_subtitle(text)
+    def set_resources_subtitle(self, _text: str) -> None:
+        pass
 
     # ── Поведение кнопок ─────────────────────────────────────────────
     def _on_listen_clicked(self) -> None:
