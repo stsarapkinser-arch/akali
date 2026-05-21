@@ -70,7 +70,15 @@ class AkaliApp(QObject):
         # === Audio thread (создан, не стартован) ===
         self._audio_thread = QThread()
         self._audio_thread.setObjectName("akali-audio")
-        self._audio_worker = AudioWorker(self._core, self._model_dir)
+        # Сохранённый индекс устройства (None = PortAudio default)
+        dev_raw = self._settings.value("audio_device", None)
+        device_index: int | None = None
+        if isinstance(dev_raw, int):
+            device_index = dev_raw
+        elif isinstance(dev_raw, str) and dev_raw.strip().lstrip("-").isdigit():
+            device_index = int(dev_raw)
+        self._audio_worker = AudioWorker(self._core, self._model_dir,
+                                          device_index=device_index)
         self._audio_worker.moveToThread(self._audio_thread)
         self._is_listening = False
 
@@ -135,6 +143,7 @@ class AkaliApp(QObject):
         w.update_requested.connect(self.run_update)
         w.show_requested.connect(self.show_window)
         w.quit_requested.connect(self.quit)
+        w.settings_page.device_changed.connect(a.set_device)
 
         # Tray → action
         t.start_clicked.connect(self.start_listening)
@@ -148,6 +157,7 @@ class AkaliApp(QObject):
         a.status_changed.connect(w.on_status)
         a.status_changed.connect(self._on_status_for_tray)
         a.text_recognized.connect(w.on_text)
+        a.partial_text.connect(w.on_partial_text)
         a.wake_word_detected.connect(w.on_wake)
         a.command_matched.connect(w.on_command_matched)
         a.command_executed.connect(w.on_command_executed)
@@ -157,6 +167,7 @@ class AkaliApp(QObject):
         a.fatal_error.connect(self._on_fatal_error)
         a.level_changed.connect(w.on_level)
         a.reindex_done.connect(w.on_reindex_done)
+        a.device_info.connect(self._on_device_info)
         a.stopped.connect(self._on_audio_stopped)
 
         # Audio thread lifecycle
@@ -186,6 +197,11 @@ class AkaliApp(QObject):
         self._tray.set_listening(False)
         self._audio_thread.quit()
         self._audio_thread.wait(2000)
+
+    @Slot(str)
+    def _on_device_info(self, info: str) -> None:
+        self._window.set_mic_subtitle(info[:40])
+        self._window.log_page.append(f"🎤 Микрофон: {info}")
 
     @Slot(str)
     def _on_status_for_tray(self, state: str) -> None:
@@ -280,21 +296,14 @@ class AkaliApp(QObject):
                         rss_kb = int(line.split()[1])
                         break
             mb = rss_kb / 1024.0
-            self._window.set_resources_subtitle(f"RAM {mb:.0f} MB · {socket.gethostname()}")
+            self._window.set_resources_subtitle(f"RAM {mb:.0f} MB")
         except OSError:
-            self._window.set_resources_subtitle(f"{socket.gethostname()}")
+            self._window.set_resources_subtitle(socket.gethostname())
 
-        # Микрофон — попробуем взять default-устройство sounddevice (если есть)
+        # Микрофон обновляется по сигналу device_info из AudioWorker'а;
+        # тут только показываем «Не слушает», когда поток выключен.
         if not self._is_listening:
             self._window.set_mic_subtitle("Не слушает")
-            return
-        try:
-            import sounddevice as sd  # noqa: WPS433
-            info = sd.query_devices(kind="input")
-            name = info.get("name", "default") if isinstance(info, dict) else str(info)
-            self._window.set_mic_subtitle(name[:40])
-        except Exception:  # noqa: BLE001
-            self._window.set_mic_subtitle("Слушает")
 
 
 # ============================================================

@@ -23,7 +23,11 @@ from .. import __version__ as AKALI_VERSION
 from ..core.backend import AssistantCore
 from ..core.updater import UpdateResult
 from .pages import CommandsPage, HomePage, LogPage, SettingsPage
-from .widgets import HeaderBar
+from .widgets import HeaderBar, StatusRow
+
+# Жёсткие границы окна — компактный вертикальный виджет
+WINDOW_WIDTH = 400
+WINDOW_HEIGHT = 720
 
 
 def _ts() -> str:
@@ -51,7 +55,18 @@ class MainWindow(QMainWindow):
         self._icon = icon or QIcon()
         self.setWindowTitle("Akali — голосовой ассистент")
         self.setWindowIcon(self._icon)
-        self.setMinimumSize(960, 720)
+        # Жёсткие ограничения: компактный вертикальный виджет
+        self.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        # Запрещаем кнопку максимизации; setFixedSize уже отрубает
+        # ресайз и (на большинстве WM) делает фуллскрин невозможным.
+        flags = self.windowFlags()
+        flags &= ~Qt.WindowMaximizeButtonHint
+        # WindowFullScreenButtonHint появился только в Qt 6.5+; в более
+        # ранних — попробуем выключить, но молча игнорируем отсутствие.
+        full_hint = getattr(Qt, "WindowFullScreenButtonHint", None)
+        if full_hint is not None:
+            flags &= ~full_hint
+        self.setWindowFlags(flags)
 
         self._build()
         self._wire()
@@ -87,19 +102,14 @@ class MainWindow(QMainWindow):
         }
         outer.addWidget(self.stack, 1)
 
-        # ── Footer ──
+        # ── Status row + Footer ──
         sep_bot = QFrame()
         sep_bot.setObjectName("bottomSeparator")
         sep_bot.setFrameShape(QFrame.HLine)
         outer.addWidget(sep_bot)
-        self.footer = QLabel(
-            f"© {datetime.datetime.now().year}  Akali  ·  "
-            f"<a href='https://github.com/stsarapkinser-arch/akali'>github.com/stsarapkinser-arch/akali</a>"
-        )
-        self.footer.setObjectName("footer")
-        self.footer.setOpenExternalLinks(True)
-        self.footer.setAlignment(Qt.AlignHCenter)
-        outer.addWidget(self.footer)
+
+        self.status_row = StatusRow()
+        outer.addWidget(self.status_row)
 
         self.setCentralWidget(central)
 
@@ -130,6 +140,11 @@ class MainWindow(QMainWindow):
     def on_text(self, text: str) -> None:
         self.home_page.show_spoken(text)
         self.log_page.append(f"🎙 «{text}»")
+
+    @Slot(str)
+    def on_partial_text(self, text: str) -> None:
+        # Partial-результат показываем «на лету», но в лог не пишем — спам
+        self.home_page.show_spoken(text)
 
     @Slot()
     def on_wake(self) -> None:
@@ -213,12 +228,12 @@ class MainWindow(QMainWindow):
         self.commands_page.refresh()
         self.log_page.append("✓ База перезагружена")
 
-    # ── Состояние трея ──────────────────────────────────────────────
+    # ── Состояние нижней строки статусов ────────────────────────────
     def set_mic_subtitle(self, text: str) -> None:
-        self.home_page.set_mic_subtitle(text)
+        self.status_row.mic.set_subtitle(text)
 
     def set_brain_subtitle(self, text: str) -> None:
-        self.home_page.set_brain_subtitle(text)
+        self.status_row.brain.set_subtitle(text)
 
     def set_resources_subtitle(self, text: str) -> None:
-        self.home_page.set_resources_subtitle(text)
+        self.status_row.resources.set_subtitle(text)

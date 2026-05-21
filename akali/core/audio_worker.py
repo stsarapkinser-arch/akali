@@ -2,19 +2,24 @@
 
 AudioWorker — QObject, который перемещается в отдельный QThread. Слот
 start_listening() блокирует поток на жизнь приложения, читая микрофон
-порциями по 0.5 секунды. Все события (статус, распознанный текст,
-найденная команда, ошибка) идут наружу через Qt-сигналы.
+порциями по 250 мс через callback PortAudio в потокобезопасную очередь.
+Все события (статус, распознанный текст, найденная команда, ошибка)
+идут наружу через Qt-сигналы.
 
-Авто-восстановление PortAudioError встроено: до AUDIO_MAX_RETRIES попыток
-с экспоненциальным backoff, между ними дергается attempt_audio_recovery().
+Wake-word триггерится дважды: на partial-результате Vosk (мгновенный
+UX-фидбек «я тебя слышу») и на финальном (там извлекаем команду).
 
-Реиндекс выполняется тут же — между чтениями микрофона. Это короткий
-блокирующий момент, но не требует перезапуска приложения.
+Авто-восстановление PortAudioError встроено: до AUDIO_MAX_RETRIES
+попыток с экспоненциальным backoff, между ними дергается
+attempt_audio_recovery().
+
+Реиндекс выполняется тут же — между блоками микрофона.
 """
 from __future__ import annotations
 
 import json
 import os
+import queue
 import struct
 import subprocess
 import time
@@ -26,6 +31,9 @@ from .backend import ACTIVE_WINDOW_SECONDS, AssistantCore
 
 AUDIO_MAX_RETRIES = 5
 AUDIO_INITIAL_BACKOFF = 2.0
+AUDIO_SAMPLE_RATE = 16000           # Vosk small-ru ждёт ровно 16 кГц
+AUDIO_BLOCK_FRAMES = 4000           # 250 мс — компромисс отзывчивость / CPU
+AUDIO_QUEUE_MAX = 32                # ≈8 секунд буфера
 
 
 class AudioWorker(QObject):
@@ -35,6 +43,7 @@ class AudioWorker(QObject):
     status_changed = Signal(str)             # "starting", "listening", "waiting_command",
                                              # "processing", "reindexing", "recovering", "stopped"
     text_recognized = Signal(str)            # сырой распознанный текст из Vosk
+    partial_text = Signal(str)               # partial из Vosk (на лету)
     wake_word_detected = Signal()            # услышали "Акали/Ассистент/Компьютер"
     command_matched = Signal(str, str, float, str)  # spoken, cmd, confidence, method
     command_executed = Signal(str, object)   # cmd, CommandResult
@@ -43,16 +52,24 @@ class AudioWorker(QObject):
     fatal_error = Signal(str)                # фатально, требует вмешательства
     level_changed = Signal(float)            # уровень микрофона 0..1
     reindex_done = Signal(bool, str, object) # ok, err_msg, ReloadStats|None
+    device_info = Signal(str)                # инфо о выбранном микрофоне (одноразово)
     stopped = Signal()                       # цикл завершился
 
-    def __init__(self, core: AssistantCore, vosk_model_dir: str, parent=None):
+    def __init__(self, core: AssistantCore, vosk_model_dir: str,
+                 device_index: int | None = None, parent=None):
         super().__init__(parent)
         self._core = core
         self._vosk_model_dir = vosk_model_dir
+        self._device_index = device_index
         self._stop_requested = False
         self._reindex_pending = False
 
     # === Слоты ===
+    @Slot(object)
+    def set_device(self, device_index):
+        """Меняет выбранное устройство; применится при следующем start."""
+        self._device_index = device_index
+
     @Slot()
     def start_listening(self):
         """Главный цикл прослушки. Блокирует поток, выходит по request_stop."""
@@ -75,7 +92,7 @@ class AudioWorker(QObject):
         try:
             self.status_changed.emit("starting")
             model = Model(self._vosk_model_dir)
-            recognizer = KaldiRecognizer(model, 16000)
+            recognizer = KaldiRecognizer(model, AUDIO_SAMPLE_RATE)
         except Exception as e:
             self.fatal_error.emit(f"Не удалось загрузить Vosk: {e}")
             self.stopped.emit()
@@ -98,7 +115,6 @@ class AudioWorker(QObject):
                     break
                 self.status_changed.emit("recovering")
                 self._attempt_audio_recovery()
-                # Sleep с прерыванием, чтобы не игнорить stop
                 slept_ms = 0
                 step_ms = 100
                 total_ms = int(backoff * 1000)
@@ -106,6 +122,8 @@ class AudioWorker(QObject):
                     QThread.msleep(step_ms)
                     slept_ms += step_ms
                 backoff *= 1.5
+                # Vosk State может содержать обрывки — пересоздаём
+                recognizer = KaldiRecognizer(model, AUDIO_SAMPLE_RATE)
             except Exception as e:
                 self.fatal_error.emit(f"Неожиданная ошибка: {e}")
                 break
@@ -124,13 +142,89 @@ class AudioWorker(QObject):
         self._reindex_pending = True
 
     # === Внутренности ===
+    def _resolve_device(self, sd) -> int | None:
+        """Подбираем рабочее input-устройство.
+
+        Приоритеты:
+            1) явно заданный self._device_index (если валидный input);
+            2) sd.default.device (если валидный input);
+            3) первое попавшееся устройство с input-каналами;
+            4) None (PortAudio выберет сам).
+        """
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return None
+
+        def is_input(idx: int) -> bool:
+            try:
+                d = devices[idx]
+                return d.get("max_input_channels", 0) > 0
+            except (IndexError, KeyError, TypeError):
+                return False
+
+        # 1) Явно заданный
+        if self._device_index is not None:
+            if is_input(self._device_index):
+                return self._device_index
+            self.error.emit(
+                f"Заданное устройство #{self._device_index} не имеет input-каналов.")
+
+        # 2) Default
+        try:
+            default = sd.default.device
+            if isinstance(default, (list, tuple)):
+                default_in = default[0]
+            else:
+                default_in = default
+            if isinstance(default_in, int) and default_in >= 0 and is_input(default_in):
+                return default_in
+        except (KeyError, IndexError, TypeError, AttributeError):
+            pass
+
+        # 3) Первое попавшееся
+        for i, d in enumerate(devices):
+            if d.get("max_input_channels", 0) > 0:
+                return i
+
+        return None
+
     def _audio_loop(self, recognizer, sd):
-        active_until = 0.0
-        self.status_changed.emit("listening")
-        with sd.RawInputStream(samplerate=16000, blocksize=16000,
-                               dtype='int16', channels=1) as stream:
+        # Очередь буферов; callback кладёт сюда, основной цикл забирает
+        audio_q: queue.Queue[bytes] = queue.Queue(maxsize=AUDIO_QUEUE_MAX)
+
+        def callback(indata, frames, time_info, status):  # noqa: ARG001
+            # status — sounddevice.CallbackFlags, печатается в str
+            try:
+                audio_q.put_nowait(bytes(indata))
+            except queue.Full:
+                # Очередь забилась — отбрасываем (UI отстаёт сильнее, чем мы успеваем читать)
+                pass
+
+        device = self._resolve_device(sd)
+        try:
+            info = sd.query_devices(device, "input") if device is not None else sd.query_devices(kind="input")
+            name = info.get("name") if isinstance(info, dict) else str(info)
+            rate = info.get("default_samplerate") if isinstance(info, dict) else "?"
+            self.device_info.emit(f"{name} @ {rate}Hz (idx={device})")
+        except Exception:
+            self.device_info.emit(f"PortAudio default (idx={device})")
+
+        with sd.RawInputStream(
+            samplerate=AUDIO_SAMPLE_RATE,
+            blocksize=AUDIO_BLOCK_FRAMES,
+            dtype="int16",
+            channels=1,
+            callback=callback,
+            device=device,
+        ):
+            self.status_changed.emit("listening")
+            active_until = 0.0
+            partial_wake_emitted = False
+            last_partial = ""
+
             while not self._stop_requested:
-                # Реиндекс, если запросили
+                # ── Реиндекс по запросу ────────────────────────────
                 if self._reindex_pending:
                     self._reindex_pending = False
                     self.status_changed.emit("reindexing")
@@ -138,24 +232,55 @@ class AudioWorker(QObject):
                     self.reindex_done.emit(
                         bool(res.get("ok")), res.get("error", ""),
                         res.get("stats"))
+                    # Сбрасываем партиал, чтобы не подцепить старые слова.
+                    try:
+                        recognizer.FinalResult()
+                    except Exception:
+                        pass
                     self.status_changed.emit("listening")
 
-                # Читаем 0.5 сек аудио
-                data, _status = stream.read(8000)
-                buf = bytes(data)
-                # Уровень микрофона
-                self.level_changed.emit(_compute_level(buf))
-                if not recognizer.AcceptWaveform(buf):
+                # ── Берём один блок (250 мс) с таймаутом ────────────
+                try:
+                    buf = audio_q.get(timeout=0.25)
+                except queue.Empty:
                     continue
 
-                result = json.loads(recognizer.Result())
-                text = (result.get("text") or "").strip()
-                if len(text) < 3:
+                # Уровень микрофона для UI
+                self.level_changed.emit(_compute_level(buf))
+
+                final = recognizer.AcceptWaveform(buf)
+
+                if not final:
+                    # Partial: для UX-фидбека и для wake-word до тишины
+                    try:
+                        partial = json.loads(recognizer.PartialResult()).get(
+                            "partial", "").strip()
+                    except (json.JSONDecodeError, AttributeError):
+                        partial = ""
+                    if partial and partial != last_partial:
+                        last_partial = partial
+                        self.partial_text.emit(partial)
+                        if not partial_wake_emitted:
+                            words = partial.split()
+                            if self._core.detect_wake_word(words) >= 0:
+                                self.wake_word_detected.emit()
+                                self.status_changed.emit("waiting_command")
+                                partial_wake_emitted = True
+                                active_until = time.time() + ACTIVE_WINDOW_SECONDS
+                    continue
+
+                # ── Финал: полная распознанная фраза ───────────────
+                last_partial = ""
+                partial_wake_emitted = False
+                try:
+                    text = json.loads(recognizer.Result()).get("text", "").strip()
+                except (json.JSONDecodeError, AttributeError):
+                    text = ""
+                if len(text) < 2:
                     continue
 
                 self.text_recognized.emit(text)
 
-                # Wake-word логика
                 now = time.time()
                 words = text.split()
                 wake_idx = self._core.detect_wake_word(words)
@@ -170,16 +295,16 @@ class AudioWorker(QObject):
                         continue
                 elif now < active_until:
                     command_text = text
-                    active_until = 0
                 else:
+                    # Не вызывали и активного окна нет — игнорируем
                     continue
 
+                active_until = 0.0
                 if len(command_text) < 3:
                     continue
-                active_until = 0
+
                 self.status_changed.emit("processing")
 
-                # Голосовая команда «переиндексируй»
                 if self._core.is_reindex_phrase(command_text):
                     self._reindex_pending = True
                     continue
@@ -229,3 +354,25 @@ def _compute_level(data_bytes: bytes) -> float:
         if s > peak:
             peak = s
     return min(peak / 32768.0, 1.0)
+
+
+def list_input_devices() -> list[tuple[int, str, int]]:
+    """Утилита для UI: возвращает [(idx, name, max_input_channels), ...].
+
+    Импортирует sounddevice только при вызове, чтобы UI мог рендериться
+    на машинах без аудио-стека.
+    """
+    try:
+        import sounddevice as sd  # noqa: WPS433
+    except ImportError:
+        return []
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return []
+    result = []
+    for i, d in enumerate(devices):
+        ch = d.get("max_input_channels", 0)
+        if ch > 0:
+            result.append((i, d.get("name", f"dev-{i}"), ch))
+    return result
