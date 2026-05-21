@@ -1,6 +1,7 @@
 # Akali — голосовой ассистент для Kali Linux / KDE Plasma 6
 
-Локальный (offline) ассистент с **GUI на PySide6**, системным треем и
+Локальный (offline) ассистент с **GUI на PySide6** в Jarvis-стилистике
+(пульсирующий «арк-реактор», cyan-акценты), системным треем и
 встроенным авто-обновлением из git. Распознаёт голос через Vosk, ищет
 команду из объединённой базы (curated + авто-индекс системы) с помощью
 fuzzy- и векторного поиска (Ollama / all-minilm), выполняет через
@@ -52,26 +53,47 @@ fuzzy- и векторного поиска (Ollama / all-minilm), выполн�
 При совпадении команды в обоих источниках приоритет у `commands.txt`,
 синонимы из авто-индекса дополняют список триггеров.
 
-## Файлы
+## Файловая структура
 
-| Файл / Папка              | Назначение |
-|---------------------------|------------|
-| `akali.py`                | Entry point (`python3 akali.py`) |
-| `core/backend.py`         | Чистая логика: база, поиск, выполнение, реиндекс |
-| `core/audio_worker.py`    | QThread: микрофон + Vosk + recovery |
-| `core/updater.py`         | git pull в фоне |
-| `ui/main_window.py`       | Главное окно (4 вкладки) |
-| `ui/tray.py`              | Системный трей |
-| `ui/styles.qss`           | Тёмная тема |
-| `assets/icon.svg`         | Иконка приложения |
-| `akali.desktop`           | Шаблон .desktop-файла для KDE-меню |
-| `commands.txt`            | Ручная база команд (188 команд / 450 триггеров) |
-| `system_indexer.py`       | Авто-индексатор системы (`.desktop` + KWin + `$PATH`) |
-| `auto_commands.json`      | Результат работы индексатора (генерируется) |
-| `vector_cache.json`       | Дисковый кэш эмбеддингов (генерируется) |
-| `validate_commands.py`    | Проверяет наличие всех бинарей из `commands.txt` |
-| `test_smoke.py`           | 11 smoke-тестов без микрофона/ollama/Vosk |
-| `requirements.txt`        | Список python-зависимостей |
+```
+akali/                          ← основной пакет
+├── __init__.py
+├── app.py                      AkaliApp — координатор подсистем
+├── paths.py                    единый источник путей
+├── core/                       чистая бизнес-логика (без Qt)
+│   ├── backend.py              фасад AssistantCore
+│   ├── db.py                   парсинг и мёрж commands.txt + auto_commands.json
+│   ├── matcher.py              fuzzy + vector + wake-word
+│   ├── cache.py                дисковый кэш эмбеддингов
+│   ├── executor.py             subprocess-запуск команд
+│   ├── audio_worker.py         QThread с микрофоном/Vosk и recovery
+│   └── updater.py              git pull --ff-only
+└── ui/                         GUI на PySide6
+    ├── main_window.py          QMainWindow с QStackedWidget страниц
+    ├── tray.py                 QSystemTrayIcon с меню
+    ├── pages/                  по одной странице на «вкладку»
+    │   ├── home_page.py            центральный реактор + статусы
+    │   ├── commands_page.py        таблица всей базы с фильтром
+    │   ├── settings_page.py        пороги, wake-words, путь к репо
+    │   └── log_page.py             накопительный лог
+    ├── widgets/                переиспользуемые виджеты
+    │   ├── reactor.py              анимированный «арк-реактор»
+    │   ├── status_row.py           нижняя строка статусов
+    │   └── header.py               верхний бар с лого и вкладками
+    └── resources/
+        ├── app.qss             тёмная cyan-тема
+        └── icon.svg            иконка приложения
+
+akali.py                        тонкий entry-point (`python3 akali.py`)
+commands.txt                    курируемая база (188 / 450 триггеров)
+system_indexer.py               индексатор системы (.desktop + KWin + $PATH)
+auto_commands.json              результат индексатора (генерируется)
+vector_cache.json               дисковый кэш эмбеддингов (генерируется)
+validate_commands.py            проверка установленных бинарей
+test_smoke.py                   11 smoke-тестов
+akali.desktop                   шаблон .desktop для KDE-меню
+requirements.txt                python-зависимости
+```
 
 ## Установка
 
@@ -142,7 +164,7 @@ sed "s|%CHANGE_ME_TO_AKALI_PATH%|$HOME/akali|g" akali.desktop > ~/.local/share/a
 
 # 2. Скопируй иконку
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps
-cp assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/akali.svg
+cp akali/ui/resources/icon.svg ~/.local/share/icons/hicolor/scalable/apps/akali.svg
 
 # 3. Обнови кэш меню
 kbuildsycoca6 2>/dev/null || kbuildsycoca5

@@ -1,0 +1,324 @@
+/* ============================================================
+   Akali — тёмная "JARVIS" тема с cyan-акцентом.
+   ============================================================ */
+
+QWidget#centralBg {
+    background-color: #060912;
+    color: #d8e4ee;
+    font-family: "Inter", "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif;
+}
+
+QMainWindow, QDialog {
+    background-color: #060912;
+    color: #d8e4ee;
+    font-family: "Inter", "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif;
+    font-size: 13px;
+}
+
+QWidget {
+    color: #d8e4ee;
+    font-family: "Inter", "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif;
+}
+
+/* === Header (верхний бар) === */
+QWidget#headerBar {
+    background-color: #07101c;
+    border-bottom: 1px solid #102236;
+}
+QLabel#brand {
+    color: #e6f7ff;
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: 4px;
+}
+QLabel#brandVersion {
+    color: #4aa0c8;
+    font-size: 10px;
+    letter-spacing: 2px;
+}
+
+/* Nav-кнопки */
+QPushButton#navTab {
+    background: transparent;
+    color: #7d99b3;
+    border: none;
+    padding: 8px 14px;
+    border-radius: 4px;
+    font-weight: 600;
+    font-size: 13px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+QPushButton#navTab:hover {
+    color: #cdeeff;
+    background: rgba(0, 212, 255, 0.06);
+}
+QPushButton#navTab:checked {
+    color: #00d4ff;
+    background: rgba(0, 212, 255, 0.10);
+    border-bottom: 2px solid #00d4ff;
+}
+
+/* === Разделители === */
+QFrame#topSeparator, QFrame#bottomSeparator, QFrame#homeSeparator {
+    color: #14283f;
+    background: #14283f;
+    max-height: 1px;
+    min-height: 1px;
+}
+
+/* === Footer === */
+QLabel#footer {
+    color: #5a7896;
+    font-size: 11px;
+    padding: 6px 0;
+    background: #060912;
+}
+QLabel#footer a {
+    color: #4aa0c8;
+    text-decoration: none;
+}
+
+/* === Stack страниц === */
+QStackedWidget#pageStack {
+    background-color: #060912;
+}
+
+/* === HomePage — большой статус-бейдж === */
+QLabel#statusBadge {
+    font-size: 12px;
+    font-weight: 700;
+    color: #e6f7ff;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    padding: 6px 14px;
+    border-radius: 14px;
+    background-color: rgba(125, 153, 179, 0.20);
+    border: 1px solid rgba(125, 153, 179, 0.35);
+}
+QLabel#statusBadge[state="listening"] {
+    color: #001823;
+    background-color: rgba(0, 212, 255, 0.85);
+    border: 1px solid rgba(0, 212, 255, 1.0);
+}
+QLabel#statusBadge[state="waiting_command"] {
+    color: #1e1500;
+    background-color: rgba(255, 200, 80, 0.85);
+    border: 1px solid rgba(255, 200, 80, 1.0);
+}
+QLabel#statusBadge[state="processing"] {
+    color: #00231a;
+    background-color: rgba(120, 255, 180, 0.85);
+}
+QLabel#statusBadge[state="reindexing"] {
+    color: #e6f7ff;
+    background-color: rgba(120, 160, 255, 0.85);
+}
+QLabel#statusBadge[state="recovering"], QLabel#statusBadge[state="error"] {
+    color: #ffffff;
+    background-color: rgba(255, 90, 90, 0.85);
+}
+
+QLabel#bigStatus {
+    color: #e6f7ff;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+}
+QLabel#hint {
+    color: #6a8aa3;
+    font-size: 12px;
+}
+QLabel#spokenText {
+    color: #4aa0c8;
+    font-size: 13px;
+    font-style: italic;
+}
+
+/* === Кнопки === */
+QPushButton#primaryBtn {
+    background-color: rgba(0, 212, 255, 0.15);
+    color: #00d4ff;
+    border: 1px solid #00d4ff;
+    padding: 10px 22px;
+    border-radius: 4px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+}
+QPushButton#primaryBtn:hover {
+    background-color: rgba(0, 212, 255, 0.25);
+    color: #5be8ff;
+}
+QPushButton#primaryBtn:pressed {
+    background-color: rgba(0, 212, 255, 0.40);
+}
+QPushButton#primaryBtn[danger="true"] {
+    background-color: rgba(255, 90, 90, 0.18);
+    color: #ff7878;
+    border: 1px solid #ff7878;
+}
+QPushButton#primaryBtn[danger="true"]:hover {
+    background-color: rgba(255, 90, 90, 0.30);
+    color: #ffa6a6;
+}
+
+QPushButton#secondaryBtn {
+    background-color: transparent;
+    color: #6a8aa3;
+    border: 1px solid #1c3349;
+    padding: 9px 18px;
+    border-radius: 4px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    font-weight: 600;
+    font-size: 12px;
+}
+QPushButton#secondaryBtn:hover {
+    color: #cdeeff;
+    border-color: #2a5980;
+    background-color: rgba(0, 212, 255, 0.05);
+}
+QPushButton#secondaryBtn:pressed {
+    background-color: rgba(0, 212, 255, 0.10);
+}
+
+QPushButton {
+    background-color: #0e1a2b;
+    color: #d8e4ee;
+    border: 1px solid #1c3349;
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #142036;
+    border-color: #2a5980;
+}
+QPushButton:pressed {
+    background-color: #0a1322;
+}
+QPushButton:disabled {
+    color: #344656;
+    background-color: #0a1322;
+}
+
+/* === Status row (нижняя строка) === */
+QWidget#statusRow {
+    background-color: rgba(7, 16, 28, 0.6);
+}
+QLabel#chipSubtitle {
+    color: #6a8aa3;
+    font-size: 11px;
+}
+
+/* === Inputs === */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit, QListWidget {
+    background-color: #0a1322;
+    border: 1px solid #1c3349;
+    border-radius: 4px;
+    padding: 7px 10px;
+    color: #d8e4ee;
+    selection-background-color: #00d4ff;
+    selection-color: #001823;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QTextEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #00d4ff;
+}
+
+/* === Tables === */
+QTableWidget {
+    background-color: #0a1322;
+    alternate-background-color: #0c1828;
+    border: 1px solid #14283f;
+    border-radius: 4px;
+    gridline-color: #14283f;
+    color: #d8e4ee;
+}
+QTableWidget::item:selected {
+    background-color: rgba(0, 212, 255, 0.20);
+    color: #cdeeff;
+}
+QHeaderView::section {
+    background-color: #0e1a2b;
+    color: #4aa0c8;
+    padding: 8px 10px;
+    border: none;
+    border-right: 1px solid #14283f;
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+
+/* === GroupBox === */
+QGroupBox {
+    background-color: rgba(10, 19, 34, 0.6);
+    border: 1px solid #14283f;
+    border-radius: 6px;
+    margin-top: 14px;
+    padding: 14px 12px 8px 12px;
+    font-weight: 600;
+    color: #4aa0c8;
+    font-size: 12px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 14px;
+    padding: 0 6px;
+    color: #4aa0c8;
+    background: transparent;
+}
+
+QFormLayout > QLabel {
+    color: #d8e4ee;
+}
+
+/* === Scrollbars === */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #1c3349;
+    min-height: 30px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover { background: #2a5980; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background: #1c3349;
+    min-width: 30px;
+    border-radius: 5px;
+}
+QScrollBar::handle:horizontal:hover { background: #2a5980; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* === Tooltips === */
+QToolTip {
+    background-color: #0e1a2b;
+    color: #cdeeff;
+    border: 1px solid #1c3349;
+    border-radius: 4px;
+    padding: 5px 7px;
+}
+
+/* === Лог QPlainTextEdit — моноширинный === */
+QPlainTextEdit {
+    font-family: "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", monospace;
+    font-size: 12px;
+    color: #cdeeff;
+    background-color: #050911;
+}

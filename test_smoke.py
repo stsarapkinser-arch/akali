@@ -1,4 +1,4 @@
-"""Smoke-тесты для core.backend.
+"""Smoke-тесты для akali.core.
 
 Подменяем ollama (его нет на CI и в окружениях разработки), затем
 проверяем парсинг commands.txt, мёрж с auto_commands.json, дисковый
@@ -40,14 +40,19 @@ def _install_fake_ollama():
 def _reset():
     _embed_calls["count"] = 0
     for name in list(sys.modules):
-        if name.startswith("core.") or name == "core":
+        if name == "akali" or name.startswith("akali."):
             sys.modules.pop(name, None)
 
 
 def _load_core():
-    """Импортирует core.backend с уже установленным фейком ollama."""
-    from core.backend import AssistantCore  # noqa: WPS433
-    return AssistantCore(base_dir=HERE)
+    """Импортирует akali.core.backend.AssistantCore с уже установленным фейком ollama."""
+    from akali.core.backend import AssistantCore  # noqa: WPS433
+    return AssistantCore(
+        commands_file=os.path.join(HERE, "commands.txt"),
+        auto_commands_file=os.path.join(HERE, "auto_commands.json"),
+        vector_cache_file=os.path.join(HERE, "vector_cache.json"),
+        indexer_script=os.path.join(HERE, "system_indexer.py"),
+    )
 
 
 # ============================================================
@@ -129,7 +134,7 @@ def main():
     # ============================================================
     # Тест 6: cosine_similarity
     # ============================================================
-    from core.backend import AssistantCore as AC
+    from akali.core.backend import AssistantCore as AC
     assert AC.cosine_similarity([1, 0, 0], [1, 0, 0]) == 1.0
     assert AC.cosine_similarity([1, 0, 0], [0, 1, 0]) == 0.0
     assert AC.cosine_similarity([], [1, 2, 3]) == 0.0
