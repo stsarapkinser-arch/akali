@@ -1,33 +1,37 @@
-"""Главное окно ассистента.
+"""Главное окно ассистента (refactored).
 
-Состав:
-    HeaderBar           — верхний бар с логотипом и вкладками.
-    QStackedWidget      — переключаемые страницы.
-    [HomePage, CommandsPage, SettingsPage, LogPage]
-    Footer (QLabel)     — копирайт + GitHub.
+Архитектура:
+    • Frameless window (без системного декора)
+    • Drag-to-move за верхней панелью (реализовано в HeaderBar)
+    • Modern dark theme (Cyber Arc)
+    • System Tray integration (minimize/restore)
+    • QStackedWidget с модульными страницами
+    • Dynamic icons из icons.py
 
-Окно НЕ владеет AudioWorker'ом; внешний координатор (`AkaliApp`) сводит
-сигналы аудио к слотам окна и обратно.
+Окно НЕ владеет AudioWorker'ом; координатор сводит сигналы.
 """
 from __future__ import annotations
 
 import datetime
 from typing import Optional
 
-from PySide6.QtCore import QSettings, Qt, Signal, Slot
+from PySide6.QtCore import QPointF, QSettings, Qt, Signal, Slot
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QFrame, QLabel, QMainWindow, QMessageBox,
+from PySide6.QtWidgets import (QApplication, QFrame, QLabel, QMainWindow, QMessageBox,
                                 QStackedWidget, QVBoxLayout, QWidget)
 
 from .. import __version__ as AKALI_VERSION
 from ..core.backend import AssistantCore
 from ..core.updater import UpdateResult
+from .icons import IconSet
 from .pages import CommandsPage, HomePage, LogPage, SettingsPage
-from .widgets import HeaderBar, StatusRow
+from .widgets import HeaderBar, StatusRow, ModernHeaderBar
 
-# Жёсткие границы окна — компактный вертикальный виджет
-WINDOW_WIDTH = 400
+# Оптимизированные размеры (responsive, но с фиксированным aspect ratio)
+WINDOW_WIDTH = 420
 WINDOW_HEIGHT = 720
+WINDOW_MIN_WIDTH = 380
+WINDOW_MIN_HEIGHT = 600
 
 
 def _ts() -> str:
@@ -35,7 +39,14 @@ def _ts() -> str:
 
 
 class MainWindow(QMainWindow):
-    """Собирает страницы и пробрасывает события дальше."""
+    """Главное окно (frameless, modern dark theme, system tray).
+
+    Сигналы:
+        start_requested, stop_requested, reindex_requested — управление аудио
+        reload_core_requested — перезагрузить базу команд
+        update_requested — проверить обновления
+        show_requested, quit_requested — управление окном
+    """
 
     # Команды от UI к координатору
     start_requested = Signal()
@@ -52,26 +63,39 @@ class MainWindow(QMainWindow):
         self._core = core
         self._settings = settings
         self._repo_dir = repo_dir
-        self._icon = icon or QIcon()
+
+        # Используем динамические иконки, если не передана явно
+        self._icon = icon or IconSet.reactor()
+
         self.setWindowTitle("Akali — голосовой ассистент")
         self.setWindowIcon(self._icon)
-        # Жёсткие ограничения: компактный вертикальный виджет
-        self.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
-        # Запрещаем кнопку максимизации; setFixedSize уже отрубает
-        # ресайз и (на большинстве WM) делает фуллскрин невозможным.
-        flags = self.windowFlags()
-        flags &= ~Qt.WindowMaximizeButtonHint
-        # WindowFullScreenButtonHint появился только в Qt 6.5+; в более
-        # ранних — попробуем выключить, но молча игнорируем отсутствие.
-        full_hint = getattr(Qt, "WindowFullScreenButtonHint", None)
-        if full_hint is not None:
-            flags &= ~full_hint
-        self.setWindowFlags(flags)
+
+        # Frameless окно (без системного декора)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+
+        # Размеры с поддержкой ресайза (но с минимальными границами)
+        self.setGeometry(100, 100, WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+
+        # Поддержка drag-to-move буде реализована в HeaderBar через mouse events
+
+        # Загружаем стиль
+        self._load_stylesheet()
 
         self._build()
         self._wire()
 
-    # ── Сборка ───────────────────────────────────────────────────────
+    def _load_stylesheet(self) -> None:
+        """Загружает app.qss."""
+        try:
+            qss_path = __file__.replace("main_window.py", "app.qss")
+            with open(qss_path, encoding="utf-8") as f:
+                stylesheet = f.read()
+            QApplication.instance().setStyleSheet(stylesheet)
+        except Exception as e:
+            print(f"Warning: Failed to load stylesheet: {e}")
+
+    # ── Сборка UI ────────────────────────────────────────────────────
     def _build(self) -> None:
         central = QWidget()
         central.setObjectName("centralBg")
@@ -79,21 +103,26 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # ── Header ──
-        self.header = HeaderBar(self._icon, AKALI_VERSION)
+        # ── Modern Header (с поддержкой drag-to-move) ──
+        self.header = ModernHeaderBar(AKALI_VERSION, parent=self)
+        self.header.setObjectName("headerBar")
         outer.addWidget(self.header)
+
+        # Разделитель
         sep_top = QFrame()
         sep_top.setObjectName("topSeparator")
         sep_top.setFrameShape(QFrame.HLine)
+        sep_top.setMaximumHeight(1)
         outer.addWidget(sep_top)
 
-        # ── Pages ──
+        # ── Страницы (QStackedWidget) ──
         self.stack = QStackedWidget()
         self.stack.setObjectName("pageStack")
         self.home_page = HomePage()
         self.commands_page = CommandsPage(self._core)
         self.settings_page = SettingsPage(self._core, self._settings, self._repo_dir)
         self.log_page = LogPage()
+
         self._page_index = {
             "home":     self.stack.addWidget(self.home_page),
             "commands": self.stack.addWidget(self.commands_page),
@@ -102,16 +131,37 @@ class MainWindow(QMainWindow):
         }
         outer.addWidget(self.stack, 1)
 
-        # ── Status row + Footer ──
+        # ── Footer (Status Row) ──
         sep_bot = QFrame()
         sep_bot.setObjectName("bottomSeparator")
         sep_bot.setFrameShape(QFrame.HLine)
+        sep_bot.setMaximumHeight(1)
         outer.addWidget(sep_bot)
 
         self.status_row = StatusRow()
         outer.addWidget(self.status_row)
 
         self.setCentralWidget(central)
+
+        # Оптимизация памяти: явно удаляем при закрытии
+        self.destroyed.connect(self._cleanup)
+
+    def _cleanup(self) -> None:
+        """Удаляет объекты для предотвращения утечек памяти."""
+        self.home_page.deleteLater()
+        self.commands_page.deleteLater()
+        self.settings_page.deleteLater()
+        self.log_page.deleteLater()
+        self.status_row.deleteLater()
+
+    def closeEvent(self, event):
+        """Переопределяем closeEvent для свёртывания в трей вместо выхода."""
+        # Если есть трей — сворачиваем, иначе выходим
+        if QApplication.instance().systemTrayIcon() is not None:
+            self.hide()
+            event.ignore()
+        else:
+            event.accept()
 
     # ── Связи ────────────────────────────────────────────────────────
     def _wire(self) -> None:
