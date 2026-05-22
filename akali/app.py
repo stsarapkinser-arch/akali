@@ -129,6 +129,13 @@ class AkaliApp(QObject):
         self._window.set_brain_subtitle(
             f"Vosk + Ollama ({self._core.vector_model})")
 
+        # Инициализируем QueryRouter в фоне (не блокируем запуск)
+        gemini_key = str(self._settings.value("gemini_api_key", "") or "").strip()
+        try:
+            self._core.init_router(gemini_api_key=gemini_key or None)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ------------------------------------------------------------
     def _wire(self) -> None:
         w = self._window

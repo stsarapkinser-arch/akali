@@ -32,8 +32,11 @@ from .backend import ACTIVE_WINDOW_SECONDS, AssistantCore
 AUDIO_MAX_RETRIES = 5
 AUDIO_INITIAL_BACKOFF = 2.0
 AUDIO_SAMPLE_RATE = 16000           # Vosk small-ru ждёт ровно 16 кГц
-AUDIO_BLOCK_FRAMES = 4000           # 250 мс — компромисс отзывчивость / CPU
+AUDIO_BLOCK_FRAMES = 4000           # 250 мс @ 16 кГц — компромисс отзывчивость / CPU
 AUDIO_QUEUE_MAX = 32                # ≈8 секунд буфера
+# Порядок перебора частот: сначала нативные 16 кГц (PipeWire обычно ок),
+# затем 48 кГц (аппаратный стандарт ALC269VC) с последующим даунсэмплом 3:1
+AUDIO_SAMPLE_RATES_TRY = [16000, 48000]
 
 
 class AudioWorker(QObject):
@@ -193,26 +196,72 @@ class AudioWorker(QObject):
         # Очередь буферов; callback кладёт сюда, основной цикл забирает
         audio_q: queue.Queue[bytes] = queue.Queue(maxsize=AUDIO_QUEUE_MAX)
 
+        # Счётчик пустых буферов для обнаружения отсутствия звука
+        empty_buffer_count = 0
+        buffer_validity_threshold = 20  # ~5 сек на 250 мс блоках
+
         def callback(indata, frames, time_info, status):  # noqa: ARG001
-            # status — sounddevice.CallbackFlags, печатается в str
             try:
                 audio_q.put_nowait(bytes(indata))
             except queue.Full:
-                # Очередь забилась — отбрасываем (UI отстаёт сильнее, чем мы успеваем читать)
                 pass
 
-        device = self._resolve_device(sd)
+        # Всегда используем device=None (PipeWire/PulseAudio wrapper),
+        # а не сырое hw:X,Y — иначе PipeWire блокирует доступ
+        device = None
+        device_name = "PipeWire/PulseAudio default"
+
         try:
-            info = sd.query_devices(device, "input") if device is not None else sd.query_devices(kind="input")
-            name = info.get("name") if isinstance(info, dict) else str(info)
-            rate = info.get("default_samplerate") if isinstance(info, dict) else "?"
-            self.device_info.emit(f"{name} @ {rate}Hz (idx={device})")
+            info = sd.query_devices(kind="input")
+            if isinstance(info, dict):
+                device_name = info.get("name", device_name)
+                hw_rate = info.get("default_samplerate", "?")
+            else:
+                hw_rate = "?"
         except Exception:
-            self.device_info.emit(f"PortAudio default (idx={device})")
+            hw_rate = "?"
+
+        # Пробуем частоты по приоритету: 16000 (нативно для Vosk) → 48000 (ALC269VC)
+        actual_rate = None
+        last_open_err = None
+        for try_rate in AUDIO_SAMPLE_RATES_TRY:
+            try:
+                # Проверяем, что поток открывается на этой частоте
+                probe = sd.RawInputStream(
+                    samplerate=try_rate,
+                    blocksize=AUDIO_BLOCK_FRAMES * (try_rate // AUDIO_SAMPLE_RATE),
+                    dtype="int16",
+                    channels=1,
+                    device=device,
+                )
+                probe.close()
+                actual_rate = try_rate
+                break
+            except Exception as e:
+                last_open_err = e
+                continue
+
+        if actual_rate is None:
+            raise sd.PortAudioError(
+                f"Не удалось открыть RawInputStream ни на одной частоте "
+                f"({AUDIO_SAMPLE_RATES_TRY}). Последняя ошибка: {last_open_err}"
+            )
+
+        need_resample = actual_rate != AUDIO_SAMPLE_RATE
+        resample_ratio = actual_rate // AUDIO_SAMPLE_RATE  # целочисленное: 3 для 48000/16000
+        blocksize = AUDIO_BLOCK_FRAMES * (actual_rate // AUDIO_SAMPLE_RATE)
+
+        self.device_info.emit(
+            f"{device_name} @ {actual_rate}Hz"
+            f"{' (→16kHz 3:1)' if need_resample else ''} "
+            f"(hw default={hw_rate}Hz)"
+        )
+
+        import numpy as np  # уже в зависимостях через embed_cache
 
         with sd.RawInputStream(
-            samplerate=AUDIO_SAMPLE_RATE,
-            blocksize=AUDIO_BLOCK_FRAMES,
+            samplerate=actual_rate,
+            blocksize=blocksize,
             dtype="int16",
             channels=1,
             callback=callback,
@@ -245,8 +294,26 @@ class AudioWorker(QObject):
                 except queue.Empty:
                     continue
 
-                # Уровень микрофона для UI
-                self.level_changed.emit(_compute_level(buf))
+                # Даунсэмплинг 48000→16000 (берём каждый resample_ratio-й сэмпл)
+                if need_resample:
+                    arr = np.frombuffer(buf, dtype=np.int16)
+                    buf = arr[::resample_ratio].tobytes()
+
+                # Валидация буфера: проверяем, что микрофон работает
+                level = _compute_level(buf)
+                self.level_changed.emit(level)
+
+                # Детектим мёртвый микрофон: если 5+ сек полной тишины, это ошибка
+                if level < 0.001:  # практически нулевой уровень
+                    empty_buffer_count += 1
+                    if empty_buffer_count >= buffer_validity_threshold:
+                        self.error.emit(
+                            f"Микрофон молчит 5+ сек. Проверь подключение "
+                            f"(PipeWire/PulseAudio/права доступа). "
+                            f"Устройство: {device_name}")
+                        empty_buffer_count = 0  # сбросим счётчик, чтобы не спамить
+                else:
+                    empty_buffer_count = 0  # есть звук → сбрасываем счётчик
 
                 final = recognizer.AcceptWaveform(buf)
 
@@ -303,6 +370,10 @@ class AudioWorker(QObject):
                 if len(command_text) < 3:
                     continue
 
+                # Фильтр шумового текста: отбрасываем бессмысленный набор слогов
+                if _is_noise_text(command_text):
+                    continue
+
                 self.status_changed.emit("processing")
 
                 if self._core.is_reindex_phrase(command_text):
@@ -311,6 +382,14 @@ class AudioWorker(QObject):
 
                 match = self._core.find(command_text)
                 if not match.found:
+                    # Fallback: QueryRouter (кэш → FastEmbed → LLM)
+                    llm_cmd = self._core.route_with_llm(command_text)
+                    if llm_cmd:
+                        self.command_matched.emit(command_text, llm_cmd, 0.0, "llm")
+                        exec_result = self._core.execute(llm_cmd)
+                        self.command_executed.emit(llm_cmd, exec_result)
+                        self.status_changed.emit("listening")
+                        continue
                     self.no_match.emit(command_text, match.confidence)
                     self.status_changed.emit("listening")
                     continue
@@ -334,8 +413,33 @@ class AudioWorker(QObject):
                 subprocess.run(cmd, capture_output=True, timeout=5)
             except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
                 continue
-        # Даём сервисам подняться.
-        QThread.sleep(2)
+        # Даём сервисам подняться — но не зависаем весь поток для N100
+        # Вместо QThread.sleep(2) используем микрыхи с проверкой остановки
+        slept = 0
+        step = 100  # 100 мс за раз
+        total = 2000  # 2 сек всего
+        while slept < total and not self._stop_requested:
+            QThread.msleep(step)
+            slept += step
+
+
+_VOWELS = frozenset("аеёиоуыьъэюяaeiouy")
+
+
+def _is_noise_text(text: str) -> bool:
+    """True если текст — артефакт распознавания (слоги, случайные буквы).
+
+    Отбрасываем фразы, где каждое «слово» короче 3 символов или состоит
+    почти целиком из гласных (характерный мусор от vosk при тишине).
+    """
+    words = text.split()
+    if not words:
+        return True
+    meaningful = 0
+    for w in words:
+        if len(w) >= 3 and not all(c in _VOWELS for c in w.lower()):
+            meaningful += 1
+    return meaningful == 0
 
 
 def _compute_level(data_bytes: bytes) -> float:

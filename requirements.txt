@@ -3,3 +3,7 @@ PySide6>=6.6
 vosk>=0.3.45
 sounddevice>=0.4.6
 ollama>=0.1.7
+numpy>=1.24
+fastembed>=0.3.0
+google-generativeai>=0.8.0
+python-dotenv>=1.0
