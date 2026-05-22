@@ -28,9 +28,20 @@ from .query_cache import QueryCache
 log = logging.getLogger(__name__)
 
 # ── Пороги и размеры ─────────────────────────────────────────
-SEMANTIC_THRESHOLD = 0.72    # минимальная косинусная похожесть для матча
+SEMANTIC_THRESHOLD = 0.82    # минимальная косинусная похожесть для матча (0.72 давало ложные срабатывания)
 CACHE_MAX_ENTRIES = 1000     # максимум записей в LRU-кэше
 EMBED_MODEL = DEFAULT_EMBED_MODEL
+
+# Команды, затрагивающие питание/сеанс — только exact match, ни embed, ни LLM
+POWER_COMMANDS: frozenset[str] = frozenset({
+    "systemctl poweroff",
+    "systemctl reboot",
+    "systemctl hibernate",
+    "systemctl suspend",
+    "shutdown -h now",
+    "reboot",
+    "poweroff",
+})
 
 
 class QueryRouter:
@@ -46,7 +57,8 @@ class QueryRouter:
         self._cache = QueryCache(cache_file, max_size=CACHE_MAX_ENTRIES)
         self._embed = EmbedCache(model_name=embed_model)
         self._ollama = OllamaClient()
-        self._gemini = GeminiClient(gemini_api_key) if gemini_api_key else None
+        # GeminiClient сам ищет ключ в .env если gemini_api_key=None
+        self._gemini = GeminiClient(gemini_api_key)
         self.semantic_threshold = semantic_threshold
 
         # Эмбеддинговая база (заполняется через load_db)
@@ -87,7 +99,7 @@ class QueryRouter:
         ШАГ 0 → ШАГ 1 → ШАГ 2 → ШАГ 3 → ШАГ 4
         """
         text = text.strip()
-        if not text:
+        if not text or len(text) < 3:
             return None
 
         # ── ШАГ 0: Быстрый кэш ────────────────────────────────
@@ -115,6 +127,11 @@ class QueryRouter:
             log.debug("ШАГ 3 (%s): нет ответа или echo error", source)
             return None
 
+        # Блокируем силовые команды из LLM/семантики — только explicit exact match
+        if llm_cmd.strip() in POWER_COMMANDS:
+            log.warning("QueryRouter: LLM вернул силовую команду %r — заблокировано", llm_cmd)
+            return None
+
         log.debug("ШАГ 3 (%s): %r → %s", source, text, llm_cmd)
 
         # ── ШАГ 4: Запись в кэш ───────────────────────────────
@@ -132,6 +149,13 @@ class QueryRouter:
                 qvec, self._db_embs, self._db_cmds, self.semantic_threshold
             )
             if cmd:
+                # Силовые команды не отдаём через семантику — только explicit exact match
+                if cmd.strip() in POWER_COMMANDS:
+                    log.warning(
+                        "QueryRouter: семантика нашла силовую команду %r (score=%.3f) — заблокировано",
+                        cmd, score,
+                    )
+                    return None
                 log.debug("FastEmbed score=%.3f для %r", score, text)
             return cmd
         except Exception as e:  # noqa: BLE001

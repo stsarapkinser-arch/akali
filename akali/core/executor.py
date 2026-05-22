@@ -71,17 +71,22 @@ def execute(cmd: str, timeout: float = 15.0) -> CommandResult:
     if not args:
         return CommandResult(cmd=cmd, error="Пустая команда")
 
+    # Передаём полное окружение чтобы qdbus/Wayland нашли DBUS_SESSION_BUS_ADDRESS
+    # и WAYLAND_DISPLAY — без этого qdbus молчит на Wayland
+    env = os.environ.copy()
+
     try:
         if is_background:
             subprocess.Popen(
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
             )
             return CommandResult(cmd=cmd, is_background=True)
 
         proc = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
+            args, capture_output=True, text=True, timeout=timeout, env=env,
         )
         return CommandResult(
             cmd=cmd,

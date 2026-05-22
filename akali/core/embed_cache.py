@@ -7,13 +7,36 @@ fastembed работает только на CPU, без CUDA — идеальн
 """
 from __future__ import annotations
 
+import logging
+import os
 import pickle
 from pathlib import Path
 
 import numpy as np
 
-DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-small"
+log = logging.getLogger(__name__)
+
+# paraphrase-multilingual-MiniLM-L12-v2 поддерживается всеми версиями fastembed
+DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 _CACHE_SUFFIX = ".embedcache.pkl"
+_FALLBACK_KEYWORD = "multilingual"
+
+
+def _find_multilingual_model(TextEmbedding) -> str | None:
+    """Ищет поддерживаемую multilingual-модель в списке fastembed."""
+    try:
+        supported = TextEmbedding.list_supported_models()
+        for entry in supported:
+            name = entry.get("model", "") if isinstance(entry, dict) else str(entry)
+            if _FALLBACK_KEYWORD in name.lower():
+                return name
+        # Нет multilingual — берём первую попавшуюся
+        if supported:
+            first = supported[0]
+            return first.get("model", "") if isinstance(first, dict) else str(first)
+    except Exception:
+        pass
+    return None
 
 
 class EmbedCache:
@@ -28,7 +51,21 @@ class EmbedCache:
         if self._model is None:
             try:
                 from fastembed import TextEmbedding  # noqa: WPS433
-                self._model = TextEmbedding(model_name=self.model_name)
+                try:
+                    self._model = TextEmbedding(model_name=self.model_name)
+                except Exception as e:
+                    # Модель не поддерживается — ищем любую multilingual-замену
+                    log.warning("FastEmbed: модель %r недоступна (%s), ищу замену…",
+                                self.model_name, e)
+                    fallback = _find_multilingual_model(TextEmbedding)
+                    if not fallback:
+                        raise RuntimeError(
+                            f"FastEmbed: модель {self.model_name!r} не поддерживается "
+                            f"и замены не найдено. Исходная ошибка: {e}"
+                        ) from e
+                    log.warning("FastEmbed: использую замену %r", fallback)
+                    self.model_name = fallback
+                    self._model = TextEmbedding(model_name=fallback)
             except ImportError as e:
                 raise RuntimeError(
                     f"fastembed не установлен. Установи: pip install fastembed. {e}"
@@ -90,8 +127,7 @@ class EmbedCache:
                 "embs": embs,
                 "cmds": cmds,
             }))
-            import os as _os
-            _os.replace(tmp, cache_path)
+            os.replace(tmp, cache_path)
         except OSError:
             pass
 
