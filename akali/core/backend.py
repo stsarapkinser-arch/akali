@@ -78,6 +78,10 @@ class AssistantCore:
         self._auto_count = 0
         self._cache = VectorCache(self.vector_cache_file, self.vector_model)
 
+        # Ollama availability check (кэшируется)
+        self._ollama_available: bool | None = None
+        self._ollama_error_logged = False
+
     # ── Совместимость с тестами / старым кодом ───────────────────────
     @property
     def base_dir(self) -> str:
@@ -111,7 +115,15 @@ class AssistantCore:
         try:
             resp = ollama.embeddings(model=self.vector_model, prompt=text)
             return resp.get("embedding", [])
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Логируем ошибку один раз при первом отказе Ollama
+            if not self._ollama_error_logged:
+                print(
+                    f"⚠️ Ollama ошибка (vector-поиск отключён): {e}\n"
+                    f"   Используется только fuzzy-matching.\n"
+                    f"   Для включения: ollama pull {self.vector_model} && ollama serve",
+                    file=sys.stderr)
+                self._ollama_error_logged = True
             return []
 
     # ── Lifecycle ────────────────────────────────────────────────────

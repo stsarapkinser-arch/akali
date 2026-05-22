@@ -193,6 +193,10 @@ class AudioWorker(QObject):
         # Очередь буферов; callback кладёт сюда, основной цикл забирает
         audio_q: queue.Queue[bytes] = queue.Queue(maxsize=AUDIO_QUEUE_MAX)
 
+        # Счётчик пустых буферов для обнаружения отсутствия звука
+        empty_buffer_count = 0
+        buffer_validity_threshold = 20  # ~5 сек на 250 мс блоках
+
         def callback(indata, frames, time_info, status):  # noqa: ARG001
             # status — sounddevice.CallbackFlags, печатается в str
             try:
@@ -202,12 +206,23 @@ class AudioWorker(QObject):
                 pass
 
         device = self._resolve_device(sd)
+        device_name = "unknown"
+
         try:
-            info = sd.query_devices(device, "input") if device is not None else sd.query_devices(kind="input")
-            name = info.get("name") if isinstance(info, dict) else str(info)
-            rate = info.get("default_samplerate") if isinstance(info, dict) else "?"
-            self.device_info.emit(f"{name} @ {rate}Hz (idx={device})")
-        except Exception:
+            if device is not None:
+                info = sd.query_devices(device, "input")
+            else:
+                info = sd.query_devices(kind="input")
+
+            if isinstance(info, dict):
+                device_name = info.get("name", "unknown")
+                rate = info.get("default_samplerate", "?")
+            else:
+                device_name = str(info)
+                rate = "?"
+            self.device_info.emit(f"{device_name} @ {rate}Hz (idx={device})")
+        except Exception as e:
+            self.error.emit(f"Ошибка запроса микрофона: {e}")
             self.device_info.emit(f"PortAudio default (idx={device})")
 
         with sd.RawInputStream(
@@ -245,8 +260,21 @@ class AudioWorker(QObject):
                 except queue.Empty:
                     continue
 
-                # Уровень микрофона для UI
-                self.level_changed.emit(_compute_level(buf))
+                # Валидация буфера: проверяем, что микрофон работает
+                level = _compute_level(buf)
+                self.level_changed.emit(level)
+
+                # Детектим мёртвый микрофон: если 5+ сек полной тишины, это ошибка
+                if level < 0.001:  # практически нулевой уровень
+                    empty_buffer_count += 1
+                    if empty_buffer_count >= buffer_validity_threshold:
+                        self.error.emit(
+                            f"Микрофон молчит 5+ сек. Проверь подключение "
+                            f"(PipeWire/PulseAudio/права доступа). "
+                            f"Устройство: {device_name}")
+                        empty_buffer_count = 0  # сбросим счётчик, чтобы не спамить
+                else:
+                    empty_buffer_count = 0  # есть звук → сбрасываем счётчик
 
                 final = recognizer.AcceptWaveform(buf)
 
@@ -334,8 +362,14 @@ class AudioWorker(QObject):
                 subprocess.run(cmd, capture_output=True, timeout=5)
             except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
                 continue
-        # Даём сервисам подняться.
-        QThread.sleep(2)
+        # Даём сервисам подняться — но не зависаем весь поток для N100
+        # Вместо QThread.sleep(2) используем микрыхи с проверкой остановки
+        slept = 0
+        step = 100  # 100 мс за раз
+        total = 2000  # 2 сек всего
+        while slept < total and not self._stop_requested:
+            QThread.msleep(step)
+            slept += step
 
 
 def _compute_level(data_bytes: bytes) -> float:
