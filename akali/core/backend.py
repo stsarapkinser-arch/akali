@@ -23,6 +23,11 @@ from .executor import CommandResult, execute
 from .matcher import MatchResult
 
 
+def _lazy_import_router():
+    from .query_router import QueryRouter  # noqa: WPS433
+    return QueryRouter
+
+
 # === Пороги по умолчанию ===
 SIMILARITY_THRESHOLD = 0.70
 VECTOR_THRESHOLD = 0.55
@@ -82,6 +87,9 @@ class AssistantCore:
         self._ollama_available: bool | None = None
         self._ollama_error_logged = False
 
+        # QueryRouter (инициализируется отдельно через init_router)
+        self._router: Optional[object] = None
+
     # ── Совместимость с тестами / старым кодом ───────────────────────
     @property
     def base_dir(self) -> str:
@@ -131,6 +139,11 @@ class AssistantCore:
         """Полная пересборка: парс commands → парс auto → построить векторы."""
         self.commands_db = self.build_commands_db()
         reused, built = self.load_or_build_vector_cache(self.commands_db)
+        if self._router is not None:
+            try:
+                self._router.load_db(self.commands_db, self.commands_file)
+            except Exception:  # noqa: BLE001
+                pass
         return ReloadStats(
             commands_total=len(self.commands_db),
             curated_count=self._curated_count,
@@ -140,6 +153,25 @@ class AssistantCore:
             vector_total=len(self.vector_cache),
             auto_sources=dict(self.auto_sources),
         )
+
+    def init_router(self, gemini_api_key: Optional[str] = None) -> None:
+        """Инициализирует QueryRouter. Вызывается из app.py после reload()."""
+        QueryRouter = _lazy_import_router()
+        self._router = QueryRouter(
+            cache_file=paths.QUERY_CACHE_JSON,
+            gemini_api_key=gemini_api_key,
+        )
+        if self.commands_db:
+            self._router.load_db(self.commands_db, self.commands_file)
+
+    def route_with_llm(self, text: str) -> Optional[str]:
+        """Пропускает запрос через QueryRouter (кэш → FastEmbed → LLM)."""
+        if self._router is None:
+            return None
+        try:
+            return self._router.route(text)
+        except Exception:  # noqa: BLE001
+            return None
 
     # ── Поиск ────────────────────────────────────────────────────────
     def fuzzy_match(self, text: str) -> MatchResult:

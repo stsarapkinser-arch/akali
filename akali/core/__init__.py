@@ -13,3 +13,7 @@ __all__ = [
     "CommandResult",
     "cosine_similarity",
 ]
+
+# QueryRouter and related classes are imported lazily to avoid loading
+# heavy dependencies (fastembed, google-generativeai) at startup.
+# Use: from akali.core.query_router import QueryRouter

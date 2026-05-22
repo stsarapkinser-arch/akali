@@ -339,6 +339,14 @@ class AudioWorker(QObject):
 
                 match = self._core.find(command_text)
                 if not match.found:
+                    # Fallback: QueryRouter (кэш → FastEmbed → LLM)
+                    llm_cmd = self._core.route_with_llm(command_text)
+                    if llm_cmd:
+                        self.command_matched.emit(command_text, llm_cmd, 0.0, "llm")
+                        exec_result = self._core.execute(llm_cmd)
+                        self.command_executed.emit(llm_cmd, exec_result)
+                        self.status_changed.emit("listening")
+                        continue
                     self.no_match.emit(command_text, match.confidence)
                     self.status_changed.emit("listening")
                     continue

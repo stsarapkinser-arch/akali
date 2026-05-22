@@ -8,6 +8,7 @@ SECURITY: Использует shlex.split() для безопасного па�
 """
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -35,10 +36,11 @@ DANGEROUS_CHARS = re.compile(r'[;|<>`$(){}[\]\\]|&&|\|\|')
 
 
 def _parse_command(cmd: str) -> list[str] | None:
-    """Парсит команду безопасно используя shlex.
-    Возвращает список аргументов или None если команда содержит опасные символы."""
+    """Парсит команду безопасно через shlex и раскрывает ~ в путях.
+    Возвращает список аргументов или None если синтаксис некорректен."""
     try:
-        return shlex.split(cmd)
+        args = shlex.split(cmd)
+        return [os.path.expanduser(a) for a in args]
     except ValueError:
         return None
 

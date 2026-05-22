@@ -122,6 +122,17 @@ class SettingsPage(QWidget):
         words_card.add(_form_row("Реиндекс", self._edit_reindex))
         col.addWidget(words_card)
 
+        # === LLM API =========================================
+        llm_card = _Card()
+        llm_card.add(_section_label("LLM (ОБЛАЧНЫЙ РОУТЕР)"))
+        self._edit_gemini_key = QLineEdit()
+        self._edit_gemini_key.setPlaceholderText("AIza… (необязательно — для Gemini)")
+        self._edit_gemini_key.setEchoMode(QLineEdit.Password)
+        self._edit_gemini_key.setText(
+            str(self._settings.value("gemini_api_key", "") or ""))
+        llm_card.add(_form_row("Gemini API", self._edit_gemini_key))
+        col.addWidget(llm_card)
+
         # === Репозиторий =====================================
         repo_card = _Card()
         repo_card.add(_section_label("РЕПОЗИТОРИЙ"))
@@ -208,6 +219,8 @@ class SettingsPage(QWidget):
         self._spin_wake.setValue(self._core.wake_threshold)
         self._edit_wake.setText(", ".join(self._core.wake_words))
         self._edit_reindex.setText(", ".join(self._core.reindex_triggers))
+        self._edit_gemini_key.setText(
+            str(self._settings.value("gemini_api_key", "") or ""))
 
     def _apply(self) -> None:
         self._core.fuzzy_threshold = self._spin_fuzzy.value()
@@ -225,6 +238,7 @@ class SettingsPage(QWidget):
         s.setValue("wake_threshold", self._core.wake_threshold)
         s.setValue("wake_words", ",".join(self._core.wake_words))
         s.setValue("reindex_triggers", ",".join(self._core.reindex_triggers))
+        s.setValue("gemini_api_key", self._edit_gemini_key.text().strip())
         s.setValue("repo_dir", self._edit_repo.text().strip() or self._repo_dir)
         self._repo_dir = self._edit_repo.text().strip() or self._repo_dir
         self.reload_requested.emit()

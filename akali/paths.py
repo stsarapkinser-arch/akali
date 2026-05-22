@@ -19,6 +19,7 @@ PROJECT_ROOT: Path = PACKAGE_DIR.parent
 COMMANDS_TXT: Path = PROJECT_ROOT / "commands.txt"
 AUTO_COMMANDS_JSON: Path = PROJECT_ROOT / "auto_commands.json"
 VECTOR_CACHE_JSON: Path = PROJECT_ROOT / "vector_cache.json"
+QUERY_CACHE_JSON: Path = PROJECT_ROOT / "query_cache.json"
 
 # ── Внешние скрипты, которые ассистент дёргает subprocess'ом ─────────
 INDEXER_SCRIPT: Path = PROJECT_ROOT / "system_indexer.py"
