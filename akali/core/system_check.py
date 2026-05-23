@@ -149,7 +149,12 @@ def _download(url: str, dest: Path, progress: Optional[ProgressFn] = None,
 
 def check_pip_package(import_name: str, pip_name: str,
                        required: bool = True) -> CheckResult:
-    """Пытается импортнуть пакет; если нет — fixable=True (через pip)."""
+    """Пытается импортнуть пакет; если нет — fixable=True (через pip).
+
+    Ловим ШИРОКО: ImportError — пакет не установлен, OSError — пакет есть, но
+    у него нет нативной либы (например, sounddevice без libportaudio.so),
+    любое другое исключение — пакет неисправен, всё равно «не доступен».
+    """
     try:
         importlib.import_module(import_name)
         return CheckResult(f"pip: {pip_name}", True, "доступен",
@@ -160,6 +165,16 @@ def check_pip_package(import_name: str, pip_name: str,
             False,
             f"{'обязательный' if required else 'опциональный'} пакет не установлен",
             fixable=True, auto_safe=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        # Например, OSError: PortAudio library not found.
+        # Пакет «технически установлен», но не работает — pip install не починит,
+        # это системная либа. Помечаем не fixable и пишем подсказку.
+        return CheckResult(
+            f"pip: {pip_name}", False,
+            f"пакет установлен, но не загружается: {e}. "
+            "Возможно нужна системная либа (sudo apt install).",
+            fixable=False, auto_safe=False,
         )
 
 
@@ -322,27 +337,43 @@ def check_gemini(api_key: str | None) -> CheckResult:
                            fixable=False, auto_safe=False)
 
 
+def _safe(check_fn: Callable[[], CheckResult], name: str) -> CheckResult:
+    """Гарантия что одна сломанная проверка не валит весь отчёт."""
+    try:
+        return check_fn()
+    except Exception as e:  # noqa: BLE001
+        log.debug("check %r raised %s", name, e)
+        return CheckResult(name, False, f"проверка упала: {e}",
+                           fixable=False, auto_safe=False)
+
+
 def run_all_checks(gemini_api_key: str | None = None) -> SystemReport:
-    """Полная диагностика. Не имеет побочных эффектов."""
+    """Полная диагностика. Не имеет побочных эффектов. Не кидает наружу."""
     report = SystemReport()
     # Системные бинари
-    report.items.append(check_curl())
-    report.items.append(check_audio_player())
-    report.items.append(check_qdbus())
+    report.items.append(_safe(check_curl, "curl"))
+    report.items.append(_safe(check_audio_player, "Аудио-плеер"))
+    report.items.append(_safe(check_qdbus, "qdbus"))
     # Python-пакеты
     for imp, pip in REQUIRED_PIP_PACKAGES:
-        report.items.append(check_pip_package(imp, pip, required=True))
+        report.items.append(_safe(
+            lambda i=imp, p=pip: check_pip_package(i, p, required=True),
+            f"pip: {pip}"))
     for imp, pip in OPTIONAL_PIP_PACKAGES:
-        report.items.append(check_pip_package(imp, pip, required=False))
+        report.items.append(_safe(
+            lambda i=imp, p=pip: check_pip_package(i, p, required=False),
+            f"pip: {pip}"))
     # Модели и движки
-    report.items.append(check_vosk_model())
-    report.items.append(check_piper_binary())
-    report.items.append(check_piper_voice())
-    report.items.append(check_espeak())
-    report.items.append(check_ollama_binary())
-    report.items.append(check_ollama_model())
+    report.items.append(_safe(check_vosk_model, "Vosk модель"))
+    report.items.append(_safe(check_piper_binary, "Piper (бинарь)"))
+    report.items.append(_safe(check_piper_voice, "Piper голос (ru-irina)"))
+    report.items.append(_safe(check_espeak, "espeak-ng"))
+    report.items.append(_safe(check_ollama_binary, "Ollama (бинарь)"))
+    report.items.append(_safe(check_ollama_model,
+                              f"Ollama модель {OLLAMA_MODEL}"))
     if gemini_api_key:
-        report.items.append(check_gemini(gemini_api_key))
+        report.items.append(_safe(
+            lambda: check_gemini(gemini_api_key), "Gemini API"))
     return report
 
 
@@ -361,27 +392,54 @@ def print_report(report: SystemReport) -> None:
 
 # ── Установки (auto_safe=True) ==========================================
 
+def _in_venv() -> bool:
+    """Внутри ли мы virtualenv/venv. Внутри venv `pip install --user`
+    падает с ошибкой 'User site-packages are not visible in this virtualenv'."""
+    if os.environ.get("VIRTUAL_ENV"):
+        return True
+    return getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+
+
 def install_pip_package(pip_name: str,
                          progress: Optional[ProgressFn] = None) -> CheckResult:
-    """pip install --user pip_name. Без sudo."""
-    _emit(progress, f"pip install --user {pip_name}…")
+    """pip install pip_name. Без sudo.
+    Внутри venv ставим в текущее окружение (без `--user`),
+    снаружи venv — обязательно с `--user`, чтобы не лезть в системный python.
+    """
+    in_venv = _in_venv()
+    cmd = [sys.executable, "-m", "pip", "install"]
+    if not in_venv:
+        cmd.append("--user")
+    cmd += ["--quiet", "--disable-pip-version-check", pip_name]
+    _emit(progress,
+          f"pip install {'(venv)' if in_venv else '--user'} {pip_name}…")
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--user", "--quiet",
-             pip_name],
-            capture_output=True, text=True, timeout=600,
-        )
-        if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "")[-300:]
-            return CheckResult(f"pip: {pip_name}", False,
-                               f"pip код {proc.returncode}: {tail}",
-                               fixable=True, auto_safe=False)
-        _emit(progress, f"Установлен {pip_name}.")
-        return CheckResult(f"pip: {pip_name}", True, "установлен",
-                           fixable=False, auto_safe=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     except (subprocess.TimeoutExpired, OSError) as e:
-        return CheckResult(f"pip: {pip_name}", False,
-                           f"pip упал: {e}", fixable=True, auto_safe=False)
+        msg = f"pip упал: {e}"
+        _emit(progress, msg)
+        return CheckResult(f"pip: {pip_name}", False, msg,
+                           fixable=True, auto_safe=False)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        msg = f"pip код {proc.returncode}: {tail}"
+        log.error("pip install %s упал: %s", pip_name, tail)
+        _emit(progress, f"✕ pip {pip_name}: {tail[:160]}")
+        return CheckResult(f"pip: {pip_name}", False, msg,
+                           fixable=True, auto_safe=False)
+    # Сбрасываем кэш импорта — свежеустановленный пакет может ещё не быть
+    # виден текущему процессу. invalidate_caches() помогает, но не всегда —
+    # если пакет из venv site-packages, он подхватится; если из --user, надо
+    # дописать путь к sys.path.
+    importlib.invalidate_caches()
+    if not in_venv:
+        import site
+        user_site = site.getusersitepackages()
+        if user_site and user_site not in sys.path:
+            sys.path.insert(0, user_site)
+    _emit(progress, f"Установлен {pip_name}.")
+    return CheckResult(f"pip: {pip_name}", True, "установлен",
+                       fixable=False, auto_safe=False)
 
 
 def install_vosk_model(progress: Optional[ProgressFn] = None) -> CheckResult:
@@ -546,7 +604,13 @@ def install_missing(report: SystemReport,
         if fix is None:
             continue
         _emit(progress, f"→ Чиню: {item.name}")
-        results.append(fix(progress))
+        try:
+            results.append(fix(progress))
+        except Exception as e:  # noqa: BLE001
+            log.error("install %r упал: %s", item.name, e)
+            results.append(CheckResult(
+                item.name, False, f"установка упала: {e}",
+                fixable=True, auto_safe=False))
     return results
 
 
@@ -556,15 +620,22 @@ def auto_install_safe(api_key: str | None = None,
 
     «Безопасное» = pip-пакеты + Vosk-модель + голос piper. Никакого sudo и
     никаких 1+ ГБ моделей без согласия.
+    Никаких исключений наружу — любой сбой логируется и возвращается отчёт.
     """
-    report = run_all_checks(api_key)
-    print_report(report)
-    if report.auto_safe_count == 0:
-        return report
-    log.info("Доустанавливаю %d безопасных компонента(ов)…",
-             report.auto_safe_count)
-    install_missing(report, progress=progress, only_auto_safe=True)
-    # Перепроверяем — статусы могли поменяться
-    report2 = run_all_checks(api_key)
-    print_report(report2)
-    return report2
+    try:
+        report = run_all_checks(api_key)
+        print_report(report)
+        if report.auto_safe_count == 0:
+            return report
+        log.info("Доустанавливаю %d безопасных компонента(ов)…",
+                 report.auto_safe_count)
+        install_missing(report, progress=progress, only_auto_safe=True)
+        # Перепроверяем — статусы могли поменяться
+        report2 = run_all_checks(api_key)
+        print_report(report2)
+        return report2
+    except Exception as e:  # noqa: BLE001
+        log.error("auto_install_safe: неожиданная ошибка: %s", e)
+        return SystemReport(items=[CheckResult(
+            "auto_install_safe", False, f"исключение: {e}",
+            fixable=False, auto_safe=False)])

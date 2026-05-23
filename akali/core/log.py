@@ -8,13 +8,19 @@ UI больше нет — пользователь смотрит лог там
   WARN  — что-то восстановимо плохое (нет интернета, модель не нашлась)
   ERROR — реальные сбои (не загрузился Vosk, упал git pull)
   DEBUG — детали пайплайна (включается переменной AKALI_DEBUG=1)
+
+Здесь же — глобальные exception hook'и, чтобы любое необработанное
+исключение (включая из не-main потоков) логировалось, а не валило процесс.
 """
 from __future__ import annotations
 
 import logging
 import os
 import sys
+import threading
 import time
+import traceback
+from pathlib import Path
 from typing import Mapping
 
 # ANSI-цвета для терминала. Если stdout не TTY, цвета отключаются.
@@ -61,6 +67,58 @@ class _HumanFormatter(logging.Formatter):
 _configured = False
 
 
+def _error_log_path() -> Path:
+    """~/.cache/akali/last_error.log — куда пишем стектрейсы необработанных
+    исключений, чтобы потом можно было разобраться даже без терминала."""
+    d = Path.home() / ".cache" / "akali"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d / "last_error.log"
+
+
+def _append_error_log(text: str) -> None:
+    try:
+        with open(_error_log_path(), "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%Y-%m-%d %H:%M:%S]\n"))
+            f.write(text)
+            f.write("\n" + "─" * 70 + "\n")
+    except OSError:
+        pass
+
+
+def _excepthook(exc_type, exc_value, exc_tb) -> None:  # noqa: ANN001
+    """Глобальный хук для main-thread. Логирует, но НЕ убивает процесс."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        # Ctrl+C — даём ему пройти штатно
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    log = logging.getLogger("akali")
+    tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    log.error("Необработанное исключение в main-thread:\n%s", tb)
+    _append_error_log(f"MAIN-THREAD\n{tb}")
+
+
+def _thread_excepthook(args) -> None:  # noqa: ANN001
+    """Глобальный хук для не-main потоков (threading)."""
+    if args.exc_type is SystemExit:
+        return
+    log = logging.getLogger("akali")
+    tb = "".join(traceback.format_exception(
+        args.exc_type, args.exc_value, args.exc_traceback))
+    name = args.thread.name if args.thread else "<unknown>"
+    log.error("Необработанное исключение в потоке %r:\n%s", name, tb)
+    _append_error_log(f"THREAD {name}\n{tb}")
+
+
+def install_global_excepthooks() -> None:
+    """Устанавливает sys.excepthook + threading.excepthook.
+    Идемпотентно. Должно вызываться сразу после setup()."""
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+
+
 def setup(level: int | None = None) -> None:
     """Настраивает root-logger один раз за процесс."""
     global _configured
@@ -83,6 +141,9 @@ def setup(level: int | None = None) -> None:
     # Шумные библиотеки придушить
     for noisy in ("urllib3", "google", "httpx", "hpack"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Сразу же устанавливаем глобальные защиты от необработанных исключений.
+    install_global_excepthooks()
 
 
 def banner(version: str) -> None:

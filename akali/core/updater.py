@@ -67,15 +67,15 @@ def get_version_info(repo_dir: str, remote: str = "origin") -> VersionInfo:
         # Текущий SHA и ветка
         head = _run(["git", "rev-parse", "HEAD"], repo_dir, timeout=5)
         branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_dir, timeout=5)
-        log = _run(["git", "log", "-1", "--pretty=%s"], repo_dir, timeout=5)
+        last_msg = _run(["git", "log", "-1", "--pretty=%s"], repo_dir, timeout=5)
 
         if head.returncode == 0:
             info.current_sha = head.stdout.strip()
             info.short_sha = info.current_sha[:8]
         if branch.returncode == 0:
             info.branch = branch.stdout.strip()
-        if log.returncode == 0:
-            info.last_commit_msg = log.stdout.strip()
+        if last_msg.returncode == 0:
+            info.last_commit_msg = last_msg.stdout.strip()
 
         # Fetch для проверки обновлений
         fetch = _run(["git", "fetch", "--prune", remote], repo_dir, timeout=30)

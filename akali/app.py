@@ -20,10 +20,14 @@ import logging
 import os
 import signal
 import socket
+import subprocess
 import sys
 from typing import Optional
 
-from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QObject, QSettings, QThread, QTimer, Signal, Slot,
+    qInstallMessageHandler, QtMsgType,
+)
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
@@ -389,14 +393,46 @@ class AkaliApp(QObject):
 
     @Slot()
     def _shutdown(self) -> None:
-        if self._is_listening:
-            self._audio_worker.request_stop()
-            self._audio_thread.quit()
-            self._audio_thread.wait(2000)
+        """Graceful shutdown ВСЕХ ресурсов. Каждый шаг изолирован в try/except,
+        чтобы один сбой не помешал остановке остального.
+        """
+        # 1. Таймеры
+        for tmr_attr in ("_resource_timer", "_auto_update_timer"):
+            try:
+                tmr = getattr(self, tmr_attr, None)
+                if tmr is not None and tmr.isActive():
+                    tmr.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 2. Audio worker
+        try:
+            if self._is_listening:
+                self._audio_worker.request_stop()
+            if self._audio_thread is not None:
+                self._audio_thread.quit()
+                self._audio_thread.wait(2500)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 3. Все runner-потоки (update/check/sys-check/auto-install/gemini-test)
+        for attr in ("_update_thread", "_check_thread", "_sys_check_thread",
+                     "_auto_install_thread", "_gemini_test_thread"):
+            try:
+                thread = getattr(self, attr, None)
+                if thread is not None and thread.isRunning():
+                    thread.quit()
+                    thread.wait(2500)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 4. TTS
         try:
             self._tts.shutdown()
         except Exception:  # noqa: BLE001
             pass
+
+        # 5. Сбросить настройки на диск
         try:
             self._settings.sync()
         except Exception:  # noqa: BLE001
@@ -424,7 +460,10 @@ class AkaliApp(QObject):
 
     @Slot(object)
     def _on_check_finished(self, info: VersionInfo) -> None:
-        self._window.settings_page.on_version_info(info)
+        try:
+            self._window.settings_page.on_version_info(info)
+        except Exception as e:  # noqa: BLE001
+            log.error("on_version_info упал: %s", e)
         self._check_thread = None
         self._check_runner = None
         if info.error:
@@ -445,6 +484,7 @@ class AkaliApp(QObject):
         repo = self._window.settings_page.repo_dir or self._repo_dir
         log.info("git pull (force=%s) в %s…", force, repo)
         thread = QThread()
+        thread.setObjectName("akali-update")
         runner = UpdateRunner(repo, force)
         runner.moveToThread(thread)
         thread.started.connect(runner.run)
@@ -452,38 +492,87 @@ class AkaliApp(QObject):
         runner.finished.connect(thread.quit)
         runner.finished.connect(runner.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_update_refs)
         self._update_thread = thread
         self._update_runner = runner
         thread.start()
 
-    @Slot(object)
-    def _on_update_finished(self, result: UpdateResult) -> None:
-        self._window.on_update_result(result)
-        self._window.settings_page.on_update_result(result)
+    @Slot()
+    def _clear_update_refs(self) -> None:
         self._update_thread = None
         self._update_runner = None
 
-        # Перезапуск если изменились .py/.qss
+    @Slot(object)
+    def _on_update_finished(self, result: UpdateResult) -> None:
+        # Каждый шаг изолирован. Никаких raise наружу — иначе Qt свалится.
+        try:
+            self._window.on_update_result(result)
+        except Exception as e:  # noqa: BLE001
+            log.error("on_update_result (window) упал: %s", e)
+        try:
+            self._window.settings_page.on_update_result(result)
+        except Exception as e:  # noqa: BLE001
+            log.error("on_update_result (settings) упал: %s", e)
+        # thread/runner будут обнулены через thread.finished → _clear_update_refs
+
         if result.ok and result.needs_restart:
             log.info("Изменения требуют перезапуска — перезапускаю через 1.5с…")
             QTimer.singleShot(1500, self._restart_app)
+        elif result.ok and result.already_up_to_date:
+            log.info("Версия уже актуальна.")
+        elif result.ok:
+            log.info("Подтянуто %d коммита(ов). Перезапуск не нужен.",
+                     len(result.pulled_commits))
+        else:
+            log.warning("Обновление не удалось: %s", result.error)
 
     def _restart_app(self) -> None:
-        """Graceful restart через os.execv. Все try/except — никаких крашей."""
+        """Graceful restart: запускаем НОВЫЙ процесс через subprocess.Popen,
+        затем чисто гасим текущий через qapp.quit(). Это безопаснее os.execv,
+        потому что Qt успевает корректно отработать деструкторы (закрыть Wayland
+        сокеты, аудио стримы, GL контексты). Если Popen упал — пробуем execv
+        как фоллбэк, но не валим процесс при провале.
+        """
+        # 1. Сначала аккуратно гасим всё на стороне Qt/потоков
         try:
             self._shutdown()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            log.error("shutdown перед рестартом упал: %s", e)
+
+        # 2. Запускаем новый процесс
+        python = sys.executable
+        argv = [python] + list(sys.argv)
         try:
-            python = sys.executable
-            argv = [python] + sys.argv
-            log.info("os.execv %s %s", python, " ".join(argv[1:]))
-            os.execv(python, argv)
+            log.info("Перезапускаю: %s", " ".join(argv))
+            # start_new_session=True — отвязываем новый процесс от текущей
+            # сессии, чтобы он пережил наш exit
+            subprocess.Popen(  # noqa: S603
+                argv,
+                cwd=self._repo_dir,
+                start_new_session=True,
+                close_fds=True,
+            )
         except OSError as e:
-            log.error("Не удалось перезапуститься: %s", e)
-            QMessageBox.warning(self._window, "Перезапуск",
-                                f"Не удалось перезапуститься: {e}\n"
-                                "Закрой и запусти приложение вручную.")
+            log.error("Popen для рестарта упал: %s. Пробую os.execv…", e)
+            try:
+                os.execv(python, argv)
+                return  # никогда не возвращается
+            except OSError as e2:
+                log.error("os.execv тоже упал: %s", e2)
+                try:
+                    QMessageBox.warning(
+                        self._window, "Перезапуск",
+                        f"Не удалось перезапуститься: {e2}\n"
+                        "Закрой и запусти приложение вручную.")
+                except Exception:  # noqa: BLE001
+                    pass
+                return  # остаёмся жить в старой версии
+
+        # 3. Завершаем старый процесс через event-loop
+        try:
+            self._qapp.quit()
+        except Exception:  # noqa: BLE001
+            os._exit(0)
 
     # ── Auto-update timer ──────────────────────────────────
     @Slot(int)
@@ -562,12 +651,15 @@ class AkaliApp(QObject):
 
     @Slot(object)
     def _on_system_check_done(self, report) -> None:
-        lines = []
-        for cr in report.items:
-            mark = "✓" if cr.ok else ("⚠" if cr.fixable else "✕")
-            lines.append(f"{mark} {cr.name}: {cr.message}")
-        system_check.print_report(report)
-        self._window.settings_page.show_check_result(lines)
+        try:
+            lines = []
+            for cr in report.items:
+                mark = "✓" if cr.ok else ("⚠" if cr.fixable else "✕")
+                lines.append(f"{mark} {cr.name}: {cr.message}")
+            system_check.print_report(report)
+            self._window.settings_page.show_check_result(lines)
+        except Exception as e:  # noqa: BLE001
+            log.error("show_check_result упал: %s", e)
         self._sys_check_thread = None
         self._sys_check_runner = None
 
@@ -582,6 +674,7 @@ class AkaliApp(QObject):
         api_key = str(self._settings.value("gemini_api_key", "") or "").strip() or None
         log.info("Старт фоновой автопроверки компонентов…")
         thread = QThread()
+        thread.setObjectName("akali-auto-install")
         runner = AutoInstallRunner(api_key)
         runner.moveToThread(thread)
         thread.started.connect(runner.run)
@@ -590,9 +683,15 @@ class AkaliApp(QObject):
         runner.finished.connect(thread.quit)
         runner.finished.connect(runner.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_auto_install_refs)
         self._auto_install_thread = thread
         self._auto_install_runner = runner
         thread.start()
+
+    @Slot()
+    def _clear_auto_install_refs(self) -> None:
+        self._auto_install_thread = None
+        self._auto_install_runner = None
 
     @Slot(str)
     def _on_auto_install_progress(self, message: str) -> None:
@@ -609,24 +708,42 @@ class AkaliApp(QObject):
                      len(report.items) - n_missing, len(report.items))
         except Exception:  # noqa: BLE001
             pass
-        self._auto_install_thread = None
-        self._auto_install_runner = None
+        # ВАЖНО: пересоздание TTS и прогрев откладываем на следующий event-loop
+        # tick через QTimer.singleShot(0). Это (а) даёт Qt-у завершить уборку
+        # QThread/QObject без гонок, (б) изолирует возможные сегфолты в
+        # onnxruntime/piper от текущего слота.
+        QTimer.singleShot(0, self._post_auto_install_refresh)
 
-        # Если piper или espeak только что появились — пересоздать TTS
+    @Slot()
+    def _post_auto_install_refresh(self) -> None:
+        """Пост-этап после auto-install. Запускается в чистом тике event-loop,
+        вне контекста worker-thread-finished слота. Каждый шаг изолирован
+        в try/except, чтобы один баг не валил процесс."""
+        # Если piper или espeak только что появились — пересоздать TTS.
         try:
-            from .core.tts import TextToSpeech as _TTS  # avoid circular
+            from .core.tts import TextToSpeech as _TTS  # noqa: WPS433
             prev_engine = self._tts.engine_name
             tts_enabled = str(self._settings.value("tts_enabled", "true")).lower() in ("1", "true", "yes")
             tts_voice = str(self._settings.value("tts_voice", "auto") or "auto")
-            self._tts = _TTS(enabled=tts_enabled, prefer=tts_voice)
-            if self._tts.engine_name != prev_engine:
-                log.info("TTS: движок обновился %r → %r", prev_engine, self._tts.engine_name)
+            new_tts = _TTS(enabled=tts_enabled, prefer=tts_voice)
+            old_tts = self._tts
+            self._tts = new_tts
+            try:
+                old_tts.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            if new_tts.engine_name != prev_engine:
+                log.info("TTS: движок обновился %r → %r",
+                         prev_engine, new_tts.engine_name)
         except Exception as e:  # noqa: BLE001
             log.warning("Не удалось пересоздать TTS: %s", e)
 
         # Прогреваем кэш частых фраз (фон, без блокировки)
         try:
-            self._tts.prewarm(blocking=False)
+            if self._tts.is_enabled():
+                self._tts.prewarm(blocking=False)
+            else:
+                log.debug("TTS prewarm пропущен: движок не активен")
         except Exception as e:  # noqa: BLE001
             log.warning("TTS prewarm не запущен: %s", e)
 
@@ -693,9 +810,26 @@ def _apply_stylesheet(app: QApplication) -> None:
             log.warning("Не удалось загрузить таблицу стилей: %s", e)
 
 
+def _qt_message_handler(mode: QtMsgType, _ctx, message: str) -> None:
+    """Перенаправляет Qt-сообщения (warnings, fatals) в наш logger.
+    Без этого Qt пишет напрямую в stderr, миксуя со stdout-логами."""
+    qt_log = logging.getLogger("qt")
+    if mode == QtMsgType.QtFatalMsg:
+        qt_log.error("Qt FATAL: %s", message)
+    elif mode == QtMsgType.QtCriticalMsg:
+        qt_log.error("Qt CRITICAL: %s", message)
+    elif mode == QtMsgType.QtWarningMsg:
+        qt_log.warning("Qt: %s", message)
+    elif mode == QtMsgType.QtInfoMsg:
+        qt_log.info("Qt: %s", message)
+    else:
+        qt_log.debug("Qt: %s", message)
+
+
 def main() -> int:
     log_setup.setup()
     log_setup.banner(AKALI_VERSION)
+    qInstallMessageHandler(_qt_message_handler)
 
     try:
         qapp = QApplication(sys.argv)
