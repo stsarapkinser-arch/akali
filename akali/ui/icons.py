@@ -5,8 +5,8 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRect, Qt
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QApplication
 
 try:
@@ -149,13 +149,15 @@ def play_icon(
     pixmap, painter = _create_pixmap(size)
 
     margin = 4
-    points = [
-        (margin, margin),
-        (margin, size - margin),
-        (size - margin, size // 2),
-    ]
+    polygon = QPolygonF([
+        QPointF(margin, margin),
+        QPointF(margin, size - margin),
+        QPointF(size - margin, size // 2),
+    ])
 
-    painter.fillPolygon(points, color)
+    painter.setBrush(color)
+    painter.setPen(Qt.NoPen)
+    painter.drawPolygon(polygon)
     painter.end()
     return QIcon(pixmap)
 
@@ -180,20 +182,20 @@ def home_icon(
     """Иконка дома (крыша + квадрат)."""
     pixmap, painter = _create_pixmap(size)
 
-    pen = QPen(color, 2)
-    painter.setPen(pen)
-
-    # Крыша (треугольник)
-    roof_points = [
-        (size // 2, 4),
-        (20, 12),
-        (4, 12),
-    ]
-    painter.drawPolygon(roof_points)
-    painter.fillPolygon(roof_points, color)
-    painter.fillPolygon(roof_points, QColor(0, 0, 0, 50))  # Затемнение для глубины
+    # Крыша (треугольник) — заливка через QPolygonF
+    roof = QPolygonF([
+        QPointF(size // 2, 4),
+        QPointF(size - 4, 12),
+        QPointF(4, 12),
+    ])
+    painter.setBrush(color)
+    painter.setPen(Qt.NoPen)
+    painter.drawPolygon(roof)
 
     # Стены (квадрат)
+    pen = QPen(color, 2)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
     painter.drawRect(4, 12, size - 8, size - 16)
 
     # Дверь

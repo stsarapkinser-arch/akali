@@ -72,22 +72,26 @@ class ReactorWidget(QWidget):
                 ring_color.setAlpha(alpha)
                 pen = QPen(ring_color, 2)
                 painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
                 painter.drawEllipse(cx - r, cy - r, 2*r, 2*r)
 
-            # Центральная сфера
-            painter.fillEllipse(cx - radius // 2, cy - radius // 2,
-                                radius, radius, QColor("#00D4FF"))
+            # Центральная сфера — setBrush + drawEllipse (fillEllipse с 5 аргументами не поддерживается)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor("#00D4FF")))
+            painter.drawEllipse(cx - radius // 2, cy - radius // 2,
+                                radius, radius)
 
             # Свечение
-            glow_color = QColor(255, 255, 255, 80)
-            painter.fillEllipse(cx - radius // 3, cy - radius // 3,
-                                radius // 2, radius // 2, glow_color)
+            painter.setBrush(QBrush(QColor(255, 255, 255, 80)))
+            painter.drawEllipse(cx - radius // 3, cy - radius // 3,
+                                radius // 2, radius // 2)
 
             self._pulse_phase += 1
         else:
             # Неактивный режим — dim circle
             pen = QPen(QColor("#30363D"), 2)
             painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(cx - radius, cy - radius, 2*radius, 2*radius)
 
         painter.end()

@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QSettings, Qt, Signal, Slot
+from PySide6.QtCore import QSettings, Qt, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QFrame, QLabel, QMainWindow, QMessageBox,
                                 QStackedWidget, QVBoxLayout, QWidget)
@@ -78,6 +78,9 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
 
         # Поддержка drag-to-move буде реализована в HeaderBar через mouse events
+
+        # Флаг: сворачивать ли в трей вместо закрытия
+        self._minimize_to_tray = False
 
         # Загружаем стиль
         self._load_stylesheet()
@@ -154,10 +157,13 @@ class MainWindow(QMainWindow):
         self.log_page.deleteLater()
         self.status_row.deleteLater()
 
+    def set_minimize_to_tray(self, value: bool) -> None:
+        """Устанавливает режим: сворачивать в трей вместо закрытия."""
+        self._minimize_to_tray = value
+
     def closeEvent(self, event):
         """Переопределяем closeEvent для свёртывания в трей вместо выхода."""
-        # Если есть трей — сворачиваем, иначе выходим
-        if QApplication.instance().systemTrayIcon() is not None:
+        if self._minimize_to_tray:
             self.hide()
             event.ignore()
         else:

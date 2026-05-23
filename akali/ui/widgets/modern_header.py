@@ -8,7 +8,7 @@ ModernHeaderBar:
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
                                 QSizePolicy, QVBoxLayout, QWidget)
@@ -108,7 +108,7 @@ class ModernHeaderBar(QFrame):
         btn = QPushButton(label)
         btn.setObjectName("tabButton")
         btn.setIcon(icon)
-        btn.setIconSize((__import__("PySide6.QtCore", fromlist=["QSize"]).QSize(16, 16)))
+        btn.setIconSize(QSize(16, 16))
         btn.setFlat(True)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setStyleSheet("""
@@ -162,7 +162,7 @@ class ModernHeaderBar(QFrame):
             widget = self.childAt(event.pos())
             if not isinstance(widget, QPushButton) and widget is not None:
                 # Клик на пустую область → начинаем drag
-                self._drag_position = event.globalPos() - self.window().frameGeometry().topLeft()
+                self._drag_position = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
                 event.accept()
             else:
                 # Клик на кнопку → пропускаем
@@ -171,7 +171,7 @@ class ModernHeaderBar(QFrame):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         """Перемещаем окно при drag."""
         if event.buttons() == Qt.LeftButton and self._drag_position is not None:
-            self.window().move(event.globalPos() - self._drag_position)
+            self.window().move(event.globalPosition().toPoint() - self._drag_position)
             event.accept()
         else:
             super().mouseMoveEvent(event)

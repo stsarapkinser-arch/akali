@@ -85,6 +85,7 @@ class AkaliApp(QObject):
         # === UI ===
         self._window = MainWindow(self._core, self._settings, self._repo_dir, icon=self._icon)
         self._tray = TrayController(self._icon, qapp)
+        self._window.set_minimize_to_tray(True)
 
         # === Update worker ===
         self._update_thread: QThread | None = None
