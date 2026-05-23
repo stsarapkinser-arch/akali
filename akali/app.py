@@ -68,6 +68,27 @@ class UpdateRunner(QObject):
 
 
 # ============================================================
+# LlmFallbackRunner — запрашивает LLM в фоне при no_match
+# ============================================================
+class LlmFallbackRunner(QObject):
+    finished = Signal(str, str)  # query, response
+
+    def __init__(self, core: AssistantCore, query: str,
+                 parent: QObject | None = None):
+        super().__init__(parent)
+        self._core = core
+        self._query = query
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            response = self._core.route_with_llm(self._query) or ""
+        except Exception:  # noqa: BLE001
+            response = ""
+        self.finished.emit(self._query, response)
+
+
+# ============================================================
 # AkaliApp — главный координатор
 # ============================================================
 class AkaliApp(QObject):
@@ -113,6 +134,10 @@ class AkaliApp(QObject):
         # === Check worker (только fetch, без pull) ===
         self._check_thread: QThread | None = None
         self._check_runner: CheckRunner | None = None
+
+        # === LLM fallback worker ===
+        self._llm_thread: QThread | None = None
+        self._llm_runner: LlmFallbackRunner | None = None
 
         # === Resource poll timer ===
         self._resource_timer = QTimer(self)
@@ -176,6 +201,8 @@ class AkaliApp(QObject):
         w.show_requested.connect(self.show_window)
         w.quit_requested.connect(self.quit)
         w.settings_page.device_changed.connect(a.set_device)
+        w.run_command_requested.connect(self._on_run_command)
+        w.llm_fallback_requested.connect(self._on_llm_fallback_requested)
 
         # Tray → action
         t.start_clicked.connect(self.start_listening)
@@ -352,6 +379,52 @@ class AkaliApp(QObject):
         self._window.settings_page.on_update_result(result)
         self._update_thread = None
         self._update_runner = None
+
+    # ------------------------------------------------------------
+    # Click-to-run из CommandsPage
+    # ------------------------------------------------------------
+    @Slot(str)
+    def _on_run_command(self, cmd: str) -> None:
+        try:
+            result = self._core.execute(cmd)
+            self._window.on_command_executed(cmd, result)
+        except Exception as e:  # noqa: BLE001
+            self._window.log_page.append(f"⚠ Ошибка запуска: {e}")
+        short = cmd[:40] + ("…" if len(cmd) > 40 else "")
+        self._window.home_page.show_toast(f"▶ {short}")
+
+    # ------------------------------------------------------------
+    # LLM-фоллбэк при no_match
+    # ------------------------------------------------------------
+    @Slot(str)
+    def _on_llm_fallback_requested(self, query: str) -> None:
+        if not query.strip():
+            return
+        if self._llm_thread and self._llm_thread.isRunning():
+            return  # уже в работе
+        thread = QThread()
+        runner = LlmFallbackRunner(self._core, query)
+        runner.moveToThread(thread)
+        thread.started.connect(runner.run)
+        runner.finished.connect(self._on_llm_fallback_done)
+        runner.finished.connect(thread.quit)
+        runner.finished.connect(runner.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_llm_thread_done)
+        self._llm_thread = thread
+        self._llm_runner = runner
+        thread.start()
+
+    @Slot()
+    def _on_llm_thread_done(self) -> None:
+        self._llm_thread = None
+        self._llm_runner = None
+
+    @Slot(str, str)
+    def _on_llm_fallback_done(self, query: str, response: str) -> None:
+        if response.strip():
+            self._window.home_page.show_llm_response(response)
+            self._window.log_page.append(f"🤖 LLM «{query}»: {response[:120]}")
 
     # ------------------------------------------------------------
     # Подписи под нижней строкой статусов

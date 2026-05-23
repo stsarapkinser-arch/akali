@@ -73,6 +73,7 @@ class AssistantCore:
         self.fuzzy_threshold = SIMILARITY_THRESHOLD
         self.vector_threshold = VECTOR_THRESHOLD
         self.wake_threshold = WAKE_THRESHOLD
+        self.energy_threshold: float = 0.0   # минимальный уровень энергии микрофона
         self.wake_words = list(DEFAULT_WAKE_WORDS)
         self.reindex_triggers = list(DEFAULT_REINDEX_TRIGGERS)
 
@@ -89,6 +90,32 @@ class AssistantCore:
 
         # QueryRouter (инициализируется отдельно через init_router)
         self._router: Optional[object] = None
+
+    # ── Категоризация команд ─────────────────────────────────────────
+    _CATEGORY_RULES: list[tuple[str, list[str]]] = [
+        ("рабочий стол", ["qdbus", "kwin", "plasma", "kglobalaccel", "xdotool"]),
+        ("браузер",      ["firefox", "chromium", "xdg-open http", "google-chrome"]),
+        ("аудио",        ["pactl", "playerctl", "amixer", "volume", "mute", "pw-cli"]),
+        ("сеть",         ["ip ", "ping", "nmcli", "iwconfig", "ss ", "netstat",
+                          "traceroute", "mtr", "nslookup", "dig ", "arp"]),
+        ("питание",      ["systemctl poweroff", "systemctl reboot", "systemctl suspend",
+                          "systemctl hibernate", "shutdown", "reboot"]),
+        ("файлы",        ["dolphin", "thunar", "ls ", "find ", "mkdir", "rm ",
+                          "du ", "df ", "tree", "lsblk"]),
+        ("терминал",     ["konsole", "alacritty", "kitty", "bash -c", "zsh -c"]),
+        ("мониторинг",   ["htop", "btop", "top ", "nvtop", "sensors", "ps ", "iostat"]),
+        ("система",      ["systemctl", "journalctl", "pkill", "kill ", "dmesg",
+                          "lspci", "lsusb", "uname", "uptime", "who "]),
+    ]
+
+    @staticmethod
+    def category_of(cmd: str) -> str:
+        """Определяет категорию bash-команды по подстрокам."""
+        lower = cmd.lower()
+        for category, patterns in AssistantCore._CATEGORY_RULES:
+            if any(p in lower for p in patterns):
+                return category
+        return "прочее"
 
     # ── Совместимость с тестами / старым кодом ───────────────────────
     @property

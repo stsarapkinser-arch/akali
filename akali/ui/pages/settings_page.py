@@ -14,7 +14,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
                                 QHBoxLayout, QLabel, QLineEdit, QProgressBar,
                                 QPushButton, QScrollArea, QSizePolicy,
-                                QTextEdit, QVBoxLayout, QWidget)
+                                QSlider, QTextEdit, QVBoxLayout, QWidget)
 
 from ...core.backend import AssistantCore
 from ...core.audio_worker import list_input_devices
@@ -313,6 +313,29 @@ class SettingsPage(QWidget):
         self._cmb_device = QComboBox()
         self._cmb_device.setMinimumHeight(30)
         audio_card.add(_form_row("Микрофон", self._cmb_device))
+
+        # Порог энергии микрофона
+        audio_card.add(_section_label("ПОРОГ ЭНЕРГИИ"))
+        energy_row = QHBoxLayout()
+        energy_row.setContentsMargins(0, 0, 0, 0)
+        energy_row.setSpacing(8)
+        self._slider_energy = QSlider(Qt.Horizontal)
+        self._slider_energy.setRange(0, 100)
+        self._slider_energy.setSingleStep(5)
+        self._slider_energy.setValue(
+            int(float(self._settings.value("energy_threshold", 0.0)) * 10000)
+        )
+        energy_row.addWidget(self._slider_energy, 1)
+        self._lbl_energy = QLabel("0.0000")
+        self._lbl_energy.setObjectName("formLabel")
+        self._lbl_energy.setFixedWidth(50)
+        energy_row.addWidget(self._lbl_energy)
+        energy_wrap = QWidget()
+        energy_wrap.setLayout(energy_row)
+        audio_card.add(_form_row("Энергия", energy_wrap))
+        self._slider_energy.valueChanged.connect(self._on_energy_changed)
+        self._on_energy_changed(self._slider_energy.value())
+
         col.addWidget(audio_card)
 
         # === Распознавание ===================================
@@ -389,6 +412,11 @@ class SettingsPage(QWidget):
         outer.addWidget(scroll, 1)
 
     # ── Утилиты для билда ────────────────────────────────────
+    @Slot(int)
+    def _on_energy_changed(self, value: int) -> None:
+        threshold = value / 10000.0
+        self._lbl_energy.setText(f"{threshold:.4f}")
+
     def _make_spin(self) -> QDoubleSpinBox:
         s = QDoubleSpinBox()
         s.setRange(0.0, 1.0)
@@ -458,6 +486,10 @@ class SettingsPage(QWidget):
         s.setValue("reindex_triggers", ",".join(self._core.reindex_triggers))
         s.setValue("gemini_api_key", self._edit_gemini_key.text().strip())
         s.setValue("repo_dir", self._edit_repo.text().strip() or self._repo_dir)
+        energy = self._slider_energy.value() / 10000.0
+        s.setValue("energy_threshold", energy)
+        if hasattr(self._core, "energy_threshold"):
+            self._core.energy_threshold = energy
         self._repo_dir = self._edit_repo.text().strip() or self._repo_dir
         self.reload_requested.emit()
 

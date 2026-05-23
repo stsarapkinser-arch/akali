@@ -57,6 +57,8 @@ class MainWindow(QMainWindow):
     check_update_requested = Signal()
     show_requested = Signal()
     quit_requested = Signal()
+    run_command_requested = Signal(str)   # запуск команды кликом из CommandsPage
+    llm_fallback_requested = Signal(str)  # LLM-фоллбэк при no_match
 
     def __init__(self, core: AssistantCore, settings: QSettings, repo_dir: str,
                  icon: Optional[QIcon] = None, parent: QWidget | None = None):
@@ -90,11 +92,10 @@ class MainWindow(QMainWindow):
         self._wire()
 
     def _load_stylesheet(self) -> None:
-        """Загружает app.qss."""
+        """Загружает app.qss из resources/."""
+        from .. import paths
         try:
-            qss_path = __file__.replace("main_window.py", "app.qss")
-            with open(qss_path, encoding="utf-8") as f:
-                stylesheet = f.read()
+            stylesheet = paths.APP_STYLESHEET.read_text(encoding="utf-8")
             QApplication.instance().setStyleSheet(stylesheet)
         except Exception as e:
             print(f"Warning: Failed to load stylesheet: {e}")
@@ -177,6 +178,7 @@ class MainWindow(QMainWindow):
         self.home_page.stop_clicked.connect(self.stop_requested.emit)
         self.home_page.reindex_clicked.connect(self.reindex_requested.emit)
         self.commands_page.reindex_requested.connect(self.reindex_requested.emit)
+        self.commands_page.run_command.connect(self.run_command_requested.emit)
         self.settings_page.reload_requested.connect(self.reload_core_requested.emit)
         self.settings_page.update_requested.connect(self.update_requested.emit)
         self.settings_page.check_update_requested.connect(self.check_update_requested.emit)
@@ -193,16 +195,19 @@ class MainWindow(QMainWindow):
     def on_status(self, status: str) -> None:
         self.home_page.set_state(status)
         self.log_page.append(f"[STATE] {status}")
+        active = status in ("listening", "waiting_command", "processing",
+                            "starting", "recovering")
+        self.status_row.set_mic_active(active)
+        self.status_row.set_brain_active(status == "processing")
 
     @Slot(str)
     def on_text(self, text: str) -> None:
-        self.home_page.show_spoken(text)
+        self.home_page.show_spoken(text, is_partial=False)
         self.log_page.append(f"🎙 «{text}»")
 
     @Slot(str)
     def on_partial_text(self, text: str) -> None:
-        # Partial-результат показываем «на лету», но в лог не пишем — спам
-        self.home_page.show_spoken(text)
+        self.home_page.show_spoken(text, is_partial=True)
 
     @Slot()
     def on_wake(self) -> None:
@@ -211,6 +216,7 @@ class MainWindow(QMainWindow):
     @Slot(str, str, float, str)
     def on_command_matched(self, spoken: str, cmd: str, conf: float, method: str) -> None:
         self.log_page.append(f"▶ {method.upper()} {conf:.2f}  «{spoken}» → {cmd}")
+        self.home_page.show_confidence(conf, method)
 
     @Slot(str, object)
     def on_command_executed(self, cmd: str, result) -> None:
@@ -232,6 +238,7 @@ class MainWindow(QMainWindow):
     @Slot(str, float)
     def on_no_match(self, spoken: str, max_conf: float) -> None:
         self.log_page.append(f"✕ «{spoken}» (max={max_conf:.2f})")
+        self.llm_fallback_requested.emit(spoken)
 
     @Slot(str)
     def on_error(self, msg: str) -> None:
@@ -246,6 +253,7 @@ class MainWindow(QMainWindow):
     @Slot(float)
     def on_level(self, level: float) -> None:
         self.home_page.set_level(level)
+        self.status_row.set_mic_level(level)
 
     @Slot(bool, str, object)
     def on_reindex_done(self, ok: bool, err: str, stats) -> None:
