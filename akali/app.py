@@ -1,19 +1,25 @@
 """AkaliApp — координатор приложения.
 
 Связывает в одно целое:
-  • AssistantCore (база команд),
-  • AudioWorker в отдельном QThread (микрофон + Vosk),
-  • MainWindow и TrayController (UI),
-  • UpdateRunner в отдельном QThread (git pull).
+  • AssistantCore (база команд + роутер) — главный пайплайн.
+  • AudioWorker в отдельном QThread (микрофон + Vosk + dispatch).
+  • MainWindow и TrayController (UI).
+  • TTS (piper / espeak-ng) — голосовой ответ.
+  • UpdateRunner в отдельном QThread (git fetch/pull/reset).
+  • SystemCheckRunner для проверки Ollama, piper, Vosk, Gemini.
+  • Авто-проверка обновлений по таймеру (опционально).
 
-Не содержит бизнес-логики — только проводка сигналов между подсистемами.
+Главные принципы:
+  • Никаких крашей — main() обёрнут в try/except.
+  • Логи — в stdout через `logging`.
+  • После обновления, если изменились .py/.qss — graceful restart os.execv.
 """
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import socket
-import subprocess
 import sys
 from typing import Optional
 
@@ -21,12 +27,18 @@ from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
+from . import __version__ as AKALI_VERSION
 from . import paths
+from .core import log as log_setup
+from .core import safety, system_check
 from .core.audio_worker import AudioWorker
 from .core.backend import AssistantCore
+from .core.tts import TextToSpeech
 from .core.updater import UpdateResult, VersionInfo, pull as git_pull, get_version_info
 from .ui.main_window import MainWindow
 from .ui.tray import TrayController
+
+log = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -54,45 +66,66 @@ class CheckRunner(QObject):
 class UpdateRunner(QObject):
     finished = Signal(object)  # UpdateResult
 
-    def __init__(self, repo_dir: str, parent: QObject | None = None):
+    def __init__(self, repo_dir: str, force: bool, parent: QObject | None = None):
         super().__init__(parent)
         self._repo_dir = repo_dir
+        self._force = force
 
     @Slot()
     def run(self) -> None:
         try:
-            result = git_pull(self._repo_dir)
+            result = git_pull(self._repo_dir, force=self._force)
         except Exception as e:  # noqa: BLE001
             result = UpdateResult(ok=False, error=f"Неожиданная ошибка: {e}")
         self.finished.emit(result)
 
 
 # ============================================================
-# LlmFallbackRunner — запрашивает LLM в фоне при no_match
+# SystemCheckRunner — проверяет компоненты
 # ============================================================
-class LlmFallbackRunner(QObject):
-    finished = Signal(str, str)  # query, response
+class SystemCheckRunner(QObject):
+    finished = Signal(object)  # SystemReport
 
-    def __init__(self, core: AssistantCore, query: str,
-                 parent: QObject | None = None):
+    def __init__(self, gemini_key: str | None, parent: QObject | None = None):
         super().__init__(parent)
-        self._core = core
-        self._query = query
+        self._gemini_key = gemini_key
 
     @Slot()
     def run(self) -> None:
         try:
-            response = self._core.route_with_llm(self._query) or ""
-        except Exception:  # noqa: BLE001
-            response = ""
-        self.finished.emit(self._query, response)
+            report = system_check.run_all_checks(self._gemini_key)
+        except Exception as e:  # noqa: BLE001
+            log.error("system_check упал: %s", e)
+            report = system_check.SystemReport(
+                checks=[system_check.CheckResult(
+                    "system_check", False, f"исключение: {e}", False)])
+        self.finished.emit(report)
+
+
+# ============================================================
+# GeminiTestRunner — проверка API key
+# ============================================================
+class GeminiTestRunner(QObject):
+    finished = Signal(bool, str)
+
+    def __init__(self, api_key: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self._api_key = api_key
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            cr = system_check.check_gemini(self._api_key)
+            self.finished.emit(cr.ok, cr.message)
+        except Exception as e:  # noqa: BLE001
+            self.finished.emit(False, f"Ошибка теста: {e}")
 
 
 # ============================================================
 # AkaliApp — главный координатор
 # ============================================================
 class AkaliApp(QObject):
-    """Соединяет core, AudioWorker, MainWindow и трей."""
+    """Соединяет core, AudioWorker, MainWindow, трей, TTS, updater."""
 
     def __init__(self, qapp: QApplication):
         super().__init__()
@@ -107,10 +140,17 @@ class AkaliApp(QObject):
         self._core = AssistantCore()
         self._restore_core_settings()
 
+        # === TTS ===
+        tts_enabled = str(self._settings.value("tts_enabled", "true")).lower() in ("1", "true", "yes")
+        tts_voice = str(self._settings.value("tts_voice", "auto") or "auto")
+        self._tts = TextToSpeech(enabled=tts_enabled, prefer=tts_voice)
+
+        # === Safety notifier ===
+        safety.set_notifier(self._on_safety_violation)
+
         # === Audio thread (создан, не стартован) ===
         self._audio_thread = QThread()
         self._audio_thread.setObjectName("akali-audio")
-        # Сохранённый индекс устройства (None = PortAudio default)
         dev_raw = self._settings.value("audio_device", None)
         device_index: int | None = None
         if isinstance(dev_raw, int):
@@ -130,31 +170,33 @@ class AkaliApp(QObject):
         # === Update worker ===
         self._update_thread: QThread | None = None
         self._update_runner: UpdateRunner | None = None
-
-        # === Check worker (только fetch, без pull) ===
         self._check_thread: QThread | None = None
         self._check_runner: CheckRunner | None = None
-
-        # === LLM fallback worker ===
-        self._llm_thread: QThread | None = None
-        self._llm_runner: LlmFallbackRunner | None = None
+        self._sys_check_thread: QThread | None = None
+        self._sys_check_runner: SystemCheckRunner | None = None
+        self._gemini_test_thread: QThread | None = None
+        self._gemini_test_runner: GeminiTestRunner | None = None
 
         # === Resource poll timer ===
         self._resource_timer = QTimer(self)
         self._resource_timer.setInterval(2000)
         self._resource_timer.timeout.connect(self._update_resources)
 
+        # === Auto-update timer ===
+        self._auto_update_timer = QTimer(self)
+        self._auto_update_timer.setSingleShot(False)
+        self._auto_update_timer.timeout.connect(self._on_auto_update_tick)
+
         self._wire()
         self._initial_load()
-        self._update_resources()  # первая выдача статусных подзаголовков
+        self._update_resources()
         self._resource_timer.start()
+        self._apply_auto_update_setting(int(self._settings.value("auto_update_minutes", 0) or 0))
 
     # ------------------------------------------------------------
     def _restore_core_settings(self) -> None:
         s = self._settings
         try:
-            self._core.fuzzy_threshold = float(s.value("fuzzy_threshold", self._core.fuzzy_threshold))
-            self._core.vector_threshold = float(s.value("vector_threshold", self._core.vector_threshold))
             self._core.wake_threshold = float(s.value("wake_threshold", self._core.wake_threshold))
         except (TypeError, ValueError):
             pass
@@ -166,30 +208,32 @@ class AkaliApp(QObject):
             self._core.reindex_triggers = [r.strip() for r in rt.split(",") if r.strip()]
 
     def _initial_load(self) -> None:
-        stats = self._core.reload()
-        srcs = ", ".join(f"{k}={v}" for k, v in stats.auto_sources.items() if v) or "—"
-        self._window.log_page.append(
-            f"⚙ Загружена база: {stats.commands_total} команд "
-            f"(curated={stats.curated_count}, auto={stats.auto_count}), "
-            f"{stats.vector_total} векторов "
-            f"(built={stats.vectors_built}, reused={stats.vectors_reused}) "
-            f"· auto: {srcs}")
-        self._window.commands_page.refresh()
-        self._window.set_brain_subtitle(
-            f"Vosk + Ollama ({self._core.vector_model})")
+        try:
+            stats = self._core.reload()
+        except Exception as e:  # noqa: BLE001
+            log.error("Не удалось прочитать базу команд: %s", e)
+            stats = None
 
-        # Инициализируем QueryRouter в фоне (не блокируем запуск)
+        if stats:
+            srcs = ", ".join(f"{k}={v}" for k, v in stats.auto_sources.items() if v) or "—"
+            log.info("База команд: %d (curated=%d, auto=%d) · auto: %s",
+                     stats.commands_total, stats.curated_count, stats.auto_count, srcs)
+
+        self._window.commands_page.refresh()
+        self._window.set_brain_subtitle("FastEmbed + Ollama/Gemini")
+
         gemini_key = str(self._settings.value("gemini_api_key", "") or "").strip()
         try:
             self._core.init_router(gemini_api_key=gemini_key or None)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("QueryRouter инициализация: %s", e)
 
     # ------------------------------------------------------------
     def _wire(self) -> None:
         w = self._window
         a = self._audio_worker
         t = self._tray
+        sp = w.settings_page
 
         # UI → action
         w.start_requested.connect(self.start_listening)
@@ -200,15 +244,22 @@ class AkaliApp(QObject):
         w.check_update_requested.connect(self.run_check)
         w.show_requested.connect(self.show_window)
         w.quit_requested.connect(self.quit)
-        w.settings_page.device_changed.connect(a.set_device)
         w.run_command_requested.connect(self._on_run_command)
-        w.llm_fallback_requested.connect(self._on_llm_fallback_requested)
+
+        # Settings page → action
+        sp.device_changed.connect(a.set_device)
+        sp.update_requested.connect(self.run_update)
+        sp.check_update_requested.connect(self.run_check)
+        sp.auto_update_changed.connect(self._apply_auto_update_setting)
+        sp.tts_settings_changed.connect(self._on_tts_settings_changed)
+        sp.gemini_test_requested.connect(self._on_gemini_test)
+        sp.system_check_requested.connect(self._on_system_check)
 
         # Tray → action
         t.start_clicked.connect(self.start_listening)
         t.stop_clicked.connect(self.stop_listening)
         t.reindex_clicked.connect(a.request_reindex)
-        t.update_clicked.connect(self.run_update)
+        t.update_clicked.connect(lambda: self.run_update(False))
         t.show_window_clicked.connect(self.show_window)
         t.quit_clicked.connect(self.quit)
 
@@ -219,8 +270,10 @@ class AkaliApp(QObject):
         a.partial_text.connect(w.on_partial_text)
         a.wake_word_detected.connect(w.on_wake)
         a.command_matched.connect(w.on_command_matched)
+        a.command_matched.connect(self._on_command_matched_voice)
         a.command_executed.connect(w.on_command_executed)
         a.no_match.connect(w.on_no_match)
+        a.no_match.connect(self._on_no_match_voice)
         a.error.connect(w.on_error)
         a.fatal_error.connect(w.on_fatal_error)
         a.fatal_error.connect(self._on_fatal_error)
@@ -260,19 +313,15 @@ class AkaliApp(QObject):
     @Slot(str)
     def _on_device_info(self, info: str) -> None:
         self._window.set_mic_subtitle(info[:40])
-        self._window.log_page.append(f"🎤 Микрофон: {info}")
+        log.info("Микрофон: %s", info)
 
     @Slot(str)
     def _on_status_for_tray(self, state: str) -> None:
         labels = {
-            "listening": "Слушаю",
-            "waiting_command": "Жду команду",
-            "processing": "Выполняю",
-            "reindexing": "Реиндексирую",
-            "recovering": "Восстанавливаю аудио",
-            "stopped": "Остановлен",
-            "starting": "Запускаюсь",
-            "error": "Ошибка",
+            "listening": "Слушаю", "waiting_command": "Жду команду",
+            "processing": "Выполняю", "reindexing": "Реиндексирую",
+            "recovering": "Восстанавливаю аудио", "stopped": "Остановлен",
+            "starting": "Запускаюсь", "error": "Ошибка",
         }
         self._tray.tray.setToolTip(f"Akali — {labels.get(state, state)}")
 
@@ -290,7 +339,7 @@ class AkaliApp(QObject):
             self._core.reload()
             self._window.reload_complete()
         except Exception as e:  # noqa: BLE001
-            self._window.log_page.append(f"⚠ Перезагрузка не удалась: {e}")
+            log.error("Перезагрузка не удалась: %s", e)
 
     @Slot()
     def show_window(self) -> None:
@@ -312,20 +361,22 @@ class AkaliApp(QObject):
             self._audio_thread.quit()
             self._audio_thread.wait(2000)
         try:
+            self._tts.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self._settings.sync()
         except Exception:  # noqa: BLE001
             pass
 
-    # ------------------------------------------------------------
+    # ── Update flow ────────────────────────────────────────
     @Slot()
     def run_check(self) -> None:
-        """Проверяет наличие обновлений (только fetch, без pull)."""
-        if self._check_thread and self._check_thread.isRunning():
-            return
-        if self._update_thread and self._update_thread.isRunning():
+        if (self._check_thread and self._check_thread.isRunning()) or \
+           (self._update_thread and self._update_thread.isRunning()):
             return
         repo = self._window.settings_page.repo_dir or self._repo_dir
-        self._window.log_page.append(f"🔍 Проверка обновлений в {repo}…")
+        log.info("Проверка обновлений в %s…", repo)
         thread = QThread()
         runner = CheckRunner(repo)
         runner.moveToThread(thread)
@@ -343,26 +394,25 @@ class AkaliApp(QObject):
         self._window.settings_page.on_version_info(info)
         self._check_thread = None
         self._check_runner = None
-        if info.has_updates:
-            self._window.log_page.append(
-                f"⬇ Доступно {info.commits_behind} новых коммитов")
-        elif not info.error:
-            self._window.log_page.append("✓ Версия актуальна")
+        if info.error:
+            log.warning("Проверка обновлений: %s", info.error)
+        elif info.has_updates:
+            log.info("Доступно %d новых коммитов", info.commits_behind)
         else:
-            self._window.log_page.append(f"⚠ Проверка обновлений: {info.error}")
+            log.info("Версия актуальна")
 
-    @Slot()
-    def run_update(self) -> None:
+    @Slot(bool)
+    def run_update(self, force: bool = False) -> None:
         if self._update_thread and self._update_thread.isRunning():
-            self._window.log_page.append("⏳ Обновление уже выполняется…")
+            log.info("Обновление уже идёт, жди…")
             return
         if self._check_thread and self._check_thread.isRunning():
-            self._window.log_page.append("⏳ Дождись завершения проверки…")
+            log.info("Дождись проверки…")
             return
         repo = self._window.settings_page.repo_dir or self._repo_dir
-        self._window.log_page.append(f"⏳ git pull в {repo}…")
+        log.info("git pull (force=%s) в %s…", force, repo)
         thread = QThread()
-        runner = UpdateRunner(repo)
+        runner = UpdateRunner(repo, force)
         runner.moveToThread(thread)
         thread.started.connect(runner.run)
         runner.finished.connect(self._on_update_finished)
@@ -380,57 +430,151 @@ class AkaliApp(QObject):
         self._update_thread = None
         self._update_runner = None
 
-    # ------------------------------------------------------------
-    # Click-to-run из CommandsPage
-    # ------------------------------------------------------------
+        # Перезапуск если изменились .py/.qss
+        if result.ok and result.needs_restart:
+            log.info("Изменения требуют перезапуска — перезапускаю через 1.5с…")
+            QTimer.singleShot(1500, self._restart_app)
+
+    def _restart_app(self) -> None:
+        """Graceful restart через os.execv. Все try/except — никаких крашей."""
+        try:
+            self._shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            python = sys.executable
+            argv = [python] + sys.argv
+            log.info("os.execv %s %s", python, " ".join(argv[1:]))
+            os.execv(python, argv)
+        except OSError as e:
+            log.error("Не удалось перезапуститься: %s", e)
+            QMessageBox.warning(self._window, "Перезапуск",
+                                f"Не удалось перезапуститься: {e}\n"
+                                "Закрой и запусти приложение вручную.")
+
+    # ── Auto-update timer ──────────────────────────────────
+    @Slot(int)
+    def _apply_auto_update_setting(self, minutes: int) -> None:
+        if minutes <= 0:
+            if self._auto_update_timer.isActive():
+                self._auto_update_timer.stop()
+                log.info("Авто-проверка обновлений выключена.")
+            return
+        self._auto_update_timer.setInterval(int(minutes * 60_000))
+        if not self._auto_update_timer.isActive():
+            self._auto_update_timer.start()
+        log.info("Авто-проверка обновлений: каждые %d мин.", minutes)
+
+    @Slot()
+    def _on_auto_update_tick(self) -> None:
+        if (self._check_thread and self._check_thread.isRunning()) or \
+           (self._update_thread and self._update_thread.isRunning()):
+            return
+        log.debug("Автоматическая проверка обновлений…")
+        self.run_check()
+
+    # ── TTS / Safety / Gemini test / system_check ───────────
+    @Slot(bool, str)
+    def _on_tts_settings_changed(self, enabled: bool, voice: str) -> None:
+        self._tts.set_enabled(enabled)
+        self._tts.set_voice(voice)
+        log.info("TTS: enabled=%s, voice=%s", enabled, voice)
+
+    def _on_safety_violation(self, source: str, command: str, reason: str) -> None:
+        """Callback от safety.report — показывает уведомление."""
+        log.warning("Safety: %s от %s — заблокировано (%s)", command, source, reason)
+        try:
+            self._window.home_page.show_toast(f"⛔ {source}: критичная команда заблокирована")
+        except Exception:  # noqa: BLE001
+            pass
+
+    @Slot(str)
+    def _on_gemini_test(self, api_key: str) -> None:
+        if self._gemini_test_thread and self._gemini_test_thread.isRunning():
+            return
+        thread = QThread()
+        runner = GeminiTestRunner(api_key)
+        runner.moveToThread(thread)
+        thread.started.connect(runner.run)
+        runner.finished.connect(self._on_gemini_test_done)
+        runner.finished.connect(thread.quit)
+        runner.finished.connect(runner.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._gemini_test_thread = thread
+        self._gemini_test_runner = runner
+        thread.start()
+
+    @Slot(bool, str)
+    def _on_gemini_test_done(self, ok: bool, message: str) -> None:
+        self._window.settings_page.show_gemini_test_result(ok, message)
+        self._gemini_test_thread = None
+        self._gemini_test_runner = None
+
+    @Slot()
+    def _on_system_check(self) -> None:
+        if self._sys_check_thread and self._sys_check_thread.isRunning():
+            return
+        api_key = str(self._settings.value("gemini_api_key", "") or "").strip() or None
+        thread = QThread()
+        runner = SystemCheckRunner(api_key)
+        runner.moveToThread(thread)
+        thread.started.connect(runner.run)
+        runner.finished.connect(self._on_system_check_done)
+        runner.finished.connect(thread.quit)
+        runner.finished.connect(runner.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._sys_check_thread = thread
+        self._sys_check_runner = runner
+        thread.start()
+
+    @Slot(object)
+    def _on_system_check_done(self, report) -> None:
+        lines = []
+        for cr in report.checks:
+            mark = "✓" if cr.ok else "✕"
+            lines.append(f"{mark} {cr.name}: {cr.message}")
+        system_check.print_report(report)
+        self._window.settings_page.show_check_result(lines)
+        self._sys_check_thread = None
+        self._sys_check_runner = None
+
+    # ── Click-to-run из CommandsPage ────────────────────────
     @Slot(str)
     def _on_run_command(self, cmd: str) -> None:
+        # Safety filter тоже здесь
+        verdict = safety.inspect(cmd)
+        if not verdict.safe:
+            safety.report("ui-click", cmd, verdict)
+            return
         try:
             result = self._core.execute(cmd)
             self._window.on_command_executed(cmd, result)
         except Exception as e:  # noqa: BLE001
-            self._window.log_page.append(f"⚠ Ошибка запуска: {e}")
+            log.error("Ошибка запуска %r: %s", cmd, e)
         short = cmd[:40] + ("…" if len(cmd) > 40 else "")
         self._window.home_page.show_toast(f"▶ {short}")
 
-    # ------------------------------------------------------------
-    # LLM-фоллбэк при no_match
-    # ------------------------------------------------------------
-    @Slot(str)
-    def _on_llm_fallback_requested(self, query: str) -> None:
-        if not query.strip():
+    # ── Голосовые отклики через TTS ─────────────────────────
+    @Slot(str, str, float, str)
+    def _on_command_matched_voice(self, spoken: str, cmd: str, conf: float, method: str) -> None:
+        if not self._tts.enabled:
             return
-        if self._llm_thread and self._llm_thread.isRunning():
-            return  # уже в работе
-        thread = QThread()
-        runner = LlmFallbackRunner(self._core, query)
-        runner.moveToThread(thread)
-        thread.started.connect(runner.run)
-        runner.finished.connect(self._on_llm_fallback_done)
-        runner.finished.connect(thread.quit)
-        runner.finished.connect(runner.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_llm_thread_done)
-        self._llm_thread = thread
-        self._llm_runner = runner
-        thread.start()
+        if method == "power":
+            self._tts.say("Выполняю команду питания")
+        elif method == "cache":
+            self._tts.say("Сделано")
+        elif method == "semantic":
+            self._tts.say("Понял, выполняю")
+        elif method in ("gemini", "ollama", "router"):
+            self._tts.say("Запускаю")
 
-    @Slot()
-    def _on_llm_thread_done(self) -> None:
-        self._llm_thread = None
-        self._llm_runner = None
+    @Slot(str, float)
+    def _on_no_match_voice(self, spoken: str, max_conf: float) -> None:
+        if self._tts.enabled:
+            self._tts.say("Не понял команду")
 
-    @Slot(str, str)
-    def _on_llm_fallback_done(self, query: str, response: str) -> None:
-        if response.strip():
-            self._window.home_page.show_llm_response(response)
-            self._window.log_page.append(f"🤖 LLM «{query}»: {response[:120]}")
-
-    # ------------------------------------------------------------
-    # Подписи под нижней строкой статусов
-    # ------------------------------------------------------------
+    # ── Status row подписи ──────────────────────────────────
     def _update_resources(self) -> None:
-        # RAM текущего процесса (без сторонних библиотек)
         try:
             with open(f"/proc/{os.getpid()}/status", "r", encoding="utf-8") as f:
                 rss_kb = 0
@@ -442,9 +586,6 @@ class AkaliApp(QObject):
             self._window.set_resources_subtitle(f"RAM {mb:.0f} MB")
         except OSError:
             self._window.set_resources_subtitle(socket.gethostname())
-
-        # Микрофон обновляется по сигналу device_info из AudioWorker'а;
-        # тут только показываем «Не слушает», когда поток выключен.
         if not self._is_listening:
             self._window.set_mic_subtitle("Не слушает")
 
@@ -454,29 +595,39 @@ class AkaliApp(QObject):
 # ============================================================
 def _apply_stylesheet(app: QApplication) -> None:
     if paths.APP_STYLESHEET.exists():
-        app.setStyleSheet(paths.APP_STYLESHEET.read_text(encoding="utf-8"))
+        try:
+            app.setStyleSheet(paths.APP_STYLESHEET.read_text(encoding="utf-8"))
+        except OSError as e:
+            log.warning("Не удалось загрузить таблицу стилей: %s", e)
 
 
 def main() -> int:
-    qapp = QApplication(sys.argv)
-    qapp.setApplicationName("Akali")
-    qapp.setApplicationDisplayName("Akali — голосовой ассистент")
-    qapp.setOrganizationName("Akali")
-    qapp.setQuitOnLastWindowClosed(False)
-    _apply_stylesheet(qapp)
+    log_setup.setup()
+    log_setup.banner(AKALI_VERSION)
 
-    if not QSystemTrayIcon.isSystemTrayAvailable():
-        QMessageBox.critical(
-            None, "Системный трей недоступен",
-            "Akali требует системный трей. На KDE Plasma он включён по умолчанию. "
-            "Под GNOME/Wayland установи расширение TopIconsFix.")
-        return 1
+    try:
+        qapp = QApplication(sys.argv)
+        qapp.setApplicationName("Akali")
+        qapp.setApplicationDisplayName("Akali — голосовой ассистент")
+        qapp.setOrganizationName("Akali")
+        qapp.setQuitOnLastWindowClosed(False)
+        _apply_stylesheet(qapp)
 
-    app = AkaliApp(qapp)
-    app.show_window()
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            QMessageBox.critical(
+                None, "Системный трей недоступен",
+                "Akali требует системный трей. На KDE Plasma он включён по умолчанию. "
+                "Под GNOME/Wayland установи расширение TopIconsFix.")
+            return 1
 
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    return qapp.exec()
+        app = AkaliApp(qapp)
+        app.show_window()
+
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        return qapp.exec()
+    except Exception as e:  # noqa: BLE001
+        log.error("Akali упал с исключением: %s", e, exc_info=True)
+        return 2
 
 
 if __name__ == "__main__":

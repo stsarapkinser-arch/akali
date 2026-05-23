@@ -1,4 +1,24 @@
+# Generated state / caches
 vector_cache.json
 auto_commands.json
+query_cache.json
+*.embedcache.pkl
+*.embedcache.tmp
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Vosk speech-recognition model (88+ MB) — downloaded by setup.sh
+model/
+
+# Local secrets
+.env
+.env.*
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

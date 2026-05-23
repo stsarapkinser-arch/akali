@@ -1,23 +1,25 @@
-"""QThread-friendly воркер микрофона + Vosk + поиска + выполнения.
+"""QThread-friendly воркер микрофона + Vosk + роутер запросов.
 
 AudioWorker — QObject, который перемещается в отдельный QThread. Слот
 start_listening() блокирует поток на жизнь приложения, читая микрофон
 порциями по 250 мс через callback PortAudio в потокобезопасную очередь.
-Все события (статус, распознанный текст, найденная команда, ошибка)
-идут наружу через Qt-сигналы.
+Все события идут наружу через Qt-сигналы.
 
-Wake-word триггерится дважды: на partial-результате Vosk (мгновенный
-UX-фидбек «я тебя слышу») и на финальном (там извлекаем команду).
+Пайплайн после распознавания финальной фразы (text):
+    1. Извлечь часть после wake-word (или принять text как команду
+       если открыто active-window).
+    2. Гейт фильтров (len ≥ 3, не шум) — иначе игнор.
+    3. Если фраза — переиндекс-команда, отметить флаг и продолжить.
+    4. power_guard.match(text) → если совпало точно — выполнить.
+    5. core.process(text) → router (cache → fastembed → LLM) → выполнить.
+    6. Иначе — emit no_match.
 
-Авто-восстановление PortAudioError встроено: до AUDIO_MAX_RETRIES
-попыток с экспоненциальным backoff, между ними дергается
-attempt_audio_recovery().
-
-Реиндекс выполняется тут же — между блоками микрофона.
+Никаких параллельных fuzzy/vector-эвристик: всё через единый роутер.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import struct
@@ -27,6 +29,8 @@ import time
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from .backend import ACTIVE_WINDOW_SECONDS, AssistantCore
+
+log = logging.getLogger(__name__)
 
 
 AUDIO_MAX_RETRIES = 5
@@ -343,7 +347,8 @@ class AudioWorker(QObject):
                     text = json.loads(recognizer.Result()).get("text", "").strip()
                 except (json.JSONDecodeError, AttributeError):
                     text = ""
-                if len(text) < 2:
+                # ТЗ: текст короче 3 символов сразу игнорируем
+                if len(text) < 3:
                     continue
 
                 self.text_recognized.emit(text)
@@ -367,11 +372,10 @@ class AudioWorker(QObject):
                     continue
 
                 active_until = 0.0
-                if len(command_text) < 3:
-                    continue
-
-                # Фильтр шумового текста: отбрасываем бессмысленный набор слогов
-                if _is_noise_text(command_text):
+                # ── Фильтр: длина и шум — до роутера ───────────────
+                if len(command_text) < 3 or _is_noise_text(command_text):
+                    log.debug("игнорирую (шум/короткая): %r", command_text)
+                    self.status_changed.emit("listening")
                     continue
 
                 self.status_changed.emit("processing")
@@ -380,24 +384,17 @@ class AudioWorker(QObject):
                     self._reindex_pending = True
                     continue
 
-                match = self._core.find(command_text)
-                if not match.found:
-                    # Fallback: QueryRouter (кэш → FastEmbed → LLM)
-                    llm_cmd = self._core.route_with_llm(command_text)
-                    if llm_cmd:
-                        self.command_matched.emit(command_text, llm_cmd, 0.0, "llm")
-                        exec_result = self._core.execute(llm_cmd)
-                        self.command_executed.emit(llm_cmd, exec_result)
-                        self.status_changed.emit("listening")
-                        continue
-                    self.no_match.emit(command_text, match.confidence)
-                    self.status_changed.emit("listening")
-                    continue
-
-                self.command_matched.emit(
-                    command_text, match.cmd, match.confidence, match.method)
-                exec_result = self._core.execute(match.cmd)
-                self.command_executed.emit(match.cmd, exec_result)
+                # ── Полный пайплайн через core.process ─────────────
+                # (power_guard → QueryRouter: кэш → FastEmbed → LLM)
+                cmd, source = self._core.process(command_text)
+                if cmd:
+                    log.info("Команда [%s]: %r → %s", source, command_text, cmd)
+                    self.command_matched.emit(command_text, cmd, 1.0, source)
+                    exec_result = self._core.execute(cmd)
+                    self.command_executed.emit(cmd, exec_result)
+                else:
+                    log.info("Не нашёл команду для %r", command_text)
+                    self.no_match.emit(command_text, 0.0)
                 self.status_changed.emit("listening")
 
     def _attempt_audio_recovery(self):
@@ -424,21 +421,36 @@ class AudioWorker(QObject):
 
 
 _VOWELS = frozenset("аеёиоуыьъэюяaeiouy")
+_CONSONANTS = frozenset("бвгджзйклмнпрстфхцчшщbcdfghjklmnpqrstvwxz")
 
 
 def _is_noise_text(text: str) -> bool:
     """True если текст — артефакт распознавания (слоги, случайные буквы).
 
-    Отбрасываем фразы, где каждое «слово» короче 3 символов или состоит
-    почти целиком из гласных (характерный мусор от vosk при тишине).
+    Эвристики:
+    1. Текст < 3 символов → шум (это ТЗ).
+    2. Слов нет вообще → шум.
+    3. Ни одного слова длиной ≥ 3 нет → шум.
+    4. Каждое «слово» состоит почти только из гласных или только из
+       согласных (характерный мусор от Vosk при тишине / эхо).
     """
+    text = text.strip()
+    if len(text) < 3:
+        return True
     words = text.split()
     if not words:
         return True
     meaningful = 0
     for w in words:
-        if len(w) >= 3 and not all(c in _VOWELS for c in w.lower()):
-            meaningful += 1
+        lw = w.lower()
+        if len(lw) < 3:
+            continue
+        n_vowels = sum(1 for c in lw if c in _VOWELS)
+        n_consonants = sum(1 for c in lw if c in _CONSONANTS)
+        # «Слово» = только гласные или только согласные → не считаем
+        if n_vowels == 0 or n_consonants == 0:
+            continue
+        meaningful += 1
     return meaningful == 0
 
 

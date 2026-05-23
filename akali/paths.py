@@ -18,8 +18,8 @@ PROJECT_ROOT: Path = PACKAGE_DIR.parent
 #    редактировать и видеть в git status) ─────────────────────────────
 COMMANDS_TXT: Path = PROJECT_ROOT / "commands.txt"
 AUTO_COMMANDS_JSON: Path = PROJECT_ROOT / "auto_commands.json"
-VECTOR_CACHE_JSON: Path = PROJECT_ROOT / "vector_cache.json"
 QUERY_CACHE_JSON: Path = PROJECT_ROOT / "query_cache.json"
+EMBED_CACHE_PKL: Path = PROJECT_ROOT / "commands.txt.embedcache.pkl"
 
 # ── Внешние скрипты, которые ассистент дёргает subprocess'ом ─────────
 INDEXER_SCRIPT: Path = PROJECT_ROOT / "system_indexer.py"

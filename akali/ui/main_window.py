@@ -1,64 +1,52 @@
-"""Главное окно ассистента (refactored).
+"""Главное окно ассистента — координатор страниц.
 
 Архитектура:
-    • Frameless window (без системного декора)
-    • Drag-to-move за верхней панелью (реализовано в HeaderBar)
-    • Modern dark theme (Cyber Arc)
-    • System Tray integration (minimize/restore)
-    • QStackedWidget с модульными страницами
-    • Dynamic icons из icons.py
+    • Frameless window (без системного декора, drag в ModernHeaderBar)
+    • QStackedWidget с тремя страницами: Главная, Команды, Настройки
+    • Тёмная футуристичная тема (Cyber Arc)
+    • System Tray (minimize/restore)
 
-Окно НЕ владеет AudioWorker'ом; координатор сводит сигналы.
+Все логи идут через `logging` в stdout, поэтому вкладки «Лог» больше нет.
 """
 from __future__ import annotations
 
-import datetime
+import logging
 from typing import Optional
 
 from PySide6.QtCore import QSettings, Qt, Signal, Slot
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QApplication, QFrame, QLabel, QMainWindow, QMessageBox,
+from PySide6.QtWidgets import (QApplication, QFrame, QMainWindow, QMessageBox,
                                 QStackedWidget, QVBoxLayout, QWidget)
 
 from .. import __version__ as AKALI_VERSION
 from ..core.backend import AssistantCore
 from ..core.updater import UpdateResult
 from .icons import IconSet
-from .pages import CommandsPage, HomePage, LogPage, SettingsPage
-from .widgets import HeaderBar, StatusRow, ModernHeaderBar
+from .pages import CommandsPage, HomePage, SettingsPage
+from .widgets import ModernHeaderBar, StatusRow
 
-# Оптимизированные размеры (responsive, но с фиксированным aspect ratio)
+log = logging.getLogger(__name__)
+
 WINDOW_WIDTH = 420
 WINDOW_HEIGHT = 720
 WINDOW_MIN_WIDTH = 380
 WINDOW_MIN_HEIGHT = 600
 
 
-def _ts() -> str:
-    return datetime.datetime.now().strftime("%H:%M:%S")
-
-
 class MainWindow(QMainWindow):
-    """Главное окно (frameless, modern dark theme, system tray).
-
-    Сигналы:
-        start_requested, stop_requested, reindex_requested — управление аудио
-        reload_core_requested — перезагрузить базу команд
-        update_requested — проверить обновления
-        show_requested, quit_requested — управление окном
-    """
+    """Главное окно: header + страницы + status row."""
 
     # Команды от UI к координатору
     start_requested = Signal()
     stop_requested = Signal()
     reindex_requested = Signal()
     reload_core_requested = Signal()
-    update_requested = Signal()
+    update_requested = Signal(bool)        # force
     check_update_requested = Signal()
     show_requested = Signal()
     quit_requested = Signal()
-    run_command_requested = Signal(str)   # запуск команды кликом из CommandsPage
-    llm_fallback_requested = Signal(str)  # LLM-фоллбэк при no_match
+    run_command_requested = Signal(str)        # запуск команды кликом из CommandsPage
+    edit_commands_requested = Signal()         # запрос пересборки базы после редактирования
 
     def __init__(self, core: AssistantCore, settings: QSettings, repo_dir: str,
                  icon: Optional[QIcon] = None, parent: QWidget | None = None):
@@ -66,41 +54,29 @@ class MainWindow(QMainWindow):
         self._core = core
         self._settings = settings
         self._repo_dir = repo_dir
-
-        # Используем динамические иконки, если не передана явно
         self._icon = icon or IconSet.reactor()
 
         self.setWindowTitle("Akali — голосовой ассистент")
         self.setWindowIcon(self._icon)
-
-        # Frameless окно (без системного декора)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-
-        # Размеры с поддержкой ресайза (но с минимальными границами)
         self.setGeometry(100, 100, WINDOW_WIDTH, WINDOW_HEIGHT)
         self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
 
-        # Поддержка drag-to-move буде реализована в HeaderBar через mouse events
-
-        # Флаг: сворачивать ли в трей вместо закрытия
         self._minimize_to_tray = False
 
-        # Загружаем стиль
         self._load_stylesheet()
-
         self._build()
         self._wire()
 
     def _load_stylesheet(self) -> None:
-        """Загружает app.qss из resources/."""
         from .. import paths
         try:
             stylesheet = paths.APP_STYLESHEET.read_text(encoding="utf-8")
             QApplication.instance().setStyleSheet(stylesheet)
-        except Exception as e:
-            print(f"Warning: Failed to load stylesheet: {e}")
+        except OSError as e:
+            log.warning("Не удалось загрузить таблицу стилей: %s", e)
 
-    # ── Сборка UI ────────────────────────────────────────────────────
+    # ── Сборка UI ─────────────────────────────────────────────
     def _build(self) -> None:
         central = QWidget()
         central.setObjectName("centralBg")
@@ -108,35 +84,29 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # ── Modern Header (с поддержкой drag-to-move) ──
         self.header = ModernHeaderBar(AKALI_VERSION, parent=self)
         self.header.setObjectName("headerBar")
         outer.addWidget(self.header)
 
-        # Разделитель
         sep_top = QFrame()
         sep_top.setObjectName("topSeparator")
         sep_top.setFrameShape(QFrame.HLine)
         sep_top.setMaximumHeight(1)
         outer.addWidget(sep_top)
 
-        # ── Страницы (QStackedWidget) ──
         self.stack = QStackedWidget()
         self.stack.setObjectName("pageStack")
         self.home_page = HomePage()
         self.commands_page = CommandsPage(self._core)
         self.settings_page = SettingsPage(self._core, self._settings, self._repo_dir)
-        self.log_page = LogPage()
 
         self._page_index = {
             "home":     self.stack.addWidget(self.home_page),
             "commands": self.stack.addWidget(self.commands_page),
             "settings": self.stack.addWidget(self.settings_page),
-            "log":      self.stack.addWidget(self.log_page),
         }
         outer.addWidget(self.stack, 1)
 
-        # ── Footer (Status Row) ──
         sep_bot = QFrame()
         sep_bot.setObjectName("bottomSeparator")
         sep_bot.setFrameShape(QFrame.HLine)
@@ -148,30 +118,17 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # Оптимизация памяти: явно удаляем при закрытии
-        self.destroyed.connect(self._cleanup)
-
-    def _cleanup(self) -> None:
-        """Удаляет объекты для предотвращения утечек памяти."""
-        self.home_page.deleteLater()
-        self.commands_page.deleteLater()
-        self.settings_page.deleteLater()
-        self.log_page.deleteLater()
-        self.status_row.deleteLater()
-
     def set_minimize_to_tray(self, value: bool) -> None:
-        """Устанавливает режим: сворачивать в трей вместо закрытия."""
         self._minimize_to_tray = value
 
-    def closeEvent(self, event):
-        """Переопределяем closeEvent для свёртывания в трей вместо выхода."""
+    def closeEvent(self, event):  # noqa: N802
         if self._minimize_to_tray:
             self.hide()
             event.ignore()
         else:
             event.accept()
 
-    # ── Связи ────────────────────────────────────────────────────────
+    # ── Связи ─────────────────────────────────────────────────
     def _wire(self) -> None:
         self.header.tab_clicked.connect(self._switch_page)
         self.home_page.start_clicked.connect(self.start_requested.emit)
@@ -179,6 +136,7 @@ class MainWindow(QMainWindow):
         self.home_page.reindex_clicked.connect(self.reindex_requested.emit)
         self.commands_page.reindex_requested.connect(self.reindex_requested.emit)
         self.commands_page.run_command.connect(self.run_command_requested.emit)
+        self.commands_page.commands_changed.connect(self._on_commands_changed)
         self.settings_page.reload_requested.connect(self.reload_core_requested.emit)
         self.settings_page.update_requested.connect(self.update_requested.emit)
         self.settings_page.check_update_requested.connect(self.check_update_requested.emit)
@@ -190,11 +148,15 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(idx)
             self.header.set_active(key)
 
-    # ── Слоты со стороны AudioWorker'а ──────────────────────────────
+    @Slot()
+    def _on_commands_changed(self) -> None:
+        """Юзер отредактировал commands.txt через UI — просим coordinator перезагрузить."""
+        self.reload_core_requested.emit()
+
+    # ── Слоты со стороны AudioWorker'а ────────────────────────
     @Slot(str)
     def on_status(self, status: str) -> None:
         self.home_page.set_state(status)
-        self.log_page.append(f"[STATE] {status}")
         active = status in ("listening", "waiting_command", "processing",
                             "starting", "recovering")
         self.status_row.set_mic_active(active)
@@ -203,7 +165,6 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_text(self, text: str) -> None:
         self.home_page.show_spoken(text, is_partial=False)
-        self.log_page.append(f"🎙 «{text}»")
 
     @Slot(str)
     def on_partial_text(self, text: str) -> None:
@@ -211,42 +172,35 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def on_wake(self) -> None:
-        self.log_page.append("🔔 Wake-word")
+        pass  # лог рисуется в audio_worker через logging
 
     @Slot(str, str, float, str)
     def on_command_matched(self, spoken: str, cmd: str, conf: float, method: str) -> None:
-        self.log_page.append(f"▶ {method.upper()} {conf:.2f}  «{spoken}» → {cmd}")
         self.home_page.show_confidence(conf, method)
 
     @Slot(str, object)
     def on_command_executed(self, cmd: str, result) -> None:
-        if getattr(result, "is_background", False):
-            self.log_page.append("   ↳ запущено в фоне")
-            return
+        # Логи рисует audio_worker и core.execute; UI просто показывает toast.
         rc = getattr(result, "returncode", 0)
-        if getattr(result, "timed_out", False):
-            self.log_page.append("   ↳ таймаут")
-        elif getattr(result, "error", ""):
-            self.log_page.append(f"   ↳ ошибка: {result.error}")
-        elif rc != 0:
-            stderr = (getattr(result, "stderr", "") or "")[:200]
-            self.log_page.append(f"   ↳ rc={rc} {stderr}")
+        if getattr(result, "is_background", False):
+            self.home_page.show_toast(f"▶ {cmd[:40]}")
+        elif getattr(result, "error", "") or rc != 0:
+            self.home_page.show_toast(f"⚠ {(getattr(result, 'error', '') or 'rc=' + str(rc))[:60]}")
         else:
-            out = (getattr(result, "stdout", "") or "")[:200]
-            self.log_page.append(f"   ↳ {out or 'ок'}")
+            self.home_page.show_toast("ок")
 
     @Slot(str, float)
     def on_no_match(self, spoken: str, max_conf: float) -> None:
-        self.log_page.append(f"✕ «{spoken}» (max={max_conf:.2f})")
-        self.llm_fallback_requested.emit(spoken)
+        self.home_page.show_toast(f"не понял: {spoken[:30]}")
 
     @Slot(str)
     def on_error(self, msg: str) -> None:
-        self.log_page.append(f"⚠ {msg}")
+        # Восстановимые ошибки уже залогированы в audio_worker; не мусорим UI.
+        self.home_page.show_toast(f"⚠ {msg[:60]}")
 
     @Slot(str)
     def on_fatal_error(self, msg: str) -> None:
-        self.log_page.append(f"💀 {msg}")
+        log.error("Фатальная ошибка: %s", msg)
         self.home_page.set_state("error")
         QMessageBox.critical(self, "Фатальная ошибка", msg)
 
@@ -259,42 +213,42 @@ class MainWindow(QMainWindow):
     def on_reindex_done(self, ok: bool, err: str, stats) -> None:
         if ok:
             n = getattr(stats, "commands_total", 0) if stats else 0
-            v = getattr(stats, "vector_total", 0) if stats else 0
-            srcs = getattr(stats, "auto_sources", {}) if stats else {}
-            src_str = ", ".join(f"{k}={vv}" for k, vv in srcs.items() if vv) or "—"
-            self.log_page.append(f"✓ Реиндекс ок: {n} команд / {v} векторов · auto: {src_str}")
+            self.home_page.show_toast(f"индекс пересобран: {n} команд")
         else:
-            self.log_page.append(f"⚠ Реиндекс не удался: {err}")
+            self.home_page.show_toast(f"реиндекс не удался: {err[:40]}")
         self.commands_page.refresh()
 
     @Slot(object)
     def on_update_result(self, result: UpdateResult) -> None:
         if not result.ok:
-            self.log_page.append(f"⚠ git pull: {result.error}")
             QMessageBox.warning(self, "Обновление не удалось", result.error)
             return
         if result.already_up_to_date:
-            self.log_page.append("✓ git pull: всё актуально")
             QMessageBox.information(self, "Уже последняя версия",
-                                    "Локальная копия уже на свежем main.")
+                                    "Локальная копия уже на свежем remote.")
             return
         commits = "\n".join(f"  {sha} {msg}" for sha, msg in result.pulled_commits) or "  (нет деталей)"
         files = "\n".join(f"  {f}" for f in result.changed_files) or "  (нет деталей)"
-        self.log_page.append(
-            f"✓ git pull: {len(result.pulled_commits)} коммитов\n{commits}\nИзменены файлы:\n{files}")
+        extra = []
+        if result.stashed:
+            extra.append("Локальные правки спрятаны в git stash.")
+        if result.forced_reset:
+            extra.append("Был выполнен reset --hard на remote.")
         msg = (
             f"Подтянуто коммитов: {len(result.pulled_commits)}\n\n{commits}\n\n"
             f"Изменённые файлы:\n{files}\n\n"
-            + ("Рекомендую перезапустить приложение, чтобы изменения вступили в силу."
-               if result.needs_restart else "Можно продолжать работу."))
+            + ("\n".join(extra) + "\n\n" if extra else "")
+            + ("Перезапускаюсь через секунду…"
+               if result.needs_restart else "Можно продолжать работу.")
+        )
         QMessageBox.information(self, "Обновление получено", msg)
 
     @Slot()
     def reload_complete(self) -> None:
         self.commands_page.refresh()
-        self.log_page.append("✓ База перезагружена")
+        self.home_page.show_toast("База перезагружена")
 
-    # ── Состояние нижней строки статусов ────────────────────────────
+    # ── Status row helpers ────────────────────────────────────
     def set_mic_subtitle(self, text: str) -> None:
         self.status_row.mic.set_subtitle(text)
 

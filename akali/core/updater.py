@@ -1,19 +1,27 @@
 """Обновление кода ассистента из git-репозитория.
 
-Через UI запускается git pull --ff-only в директории проекта. Перед
-обновлением проверяем, что:
-  1. Директория — это git-репозиторий.
-  2. Working tree чистый (нет несохранённых изменений).
-  3. Текущая ветка не detached HEAD.
+Через UI запускается обновление в директории проекта. Алгоритм:
+  1. Проверяем что это git-репозиторий.
+  2. Если есть локальные правки и пользователь разрешил `force=True` —
+     сохраняем их в stash с пометкой времени (можно потом восстановить),
+     иначе отказываемся.
+  3. `git fetch --prune origin`.
+  4. Пытаемся `git pull --ff-only`. Если fast-forward не получается
+     (расходятся истории) и force=True — `git reset --hard origin/<branch>`.
+  5. Если изменились `.py`/`.qss` — `needs_restart=True`. App.py должен
+     перезапуститься через `os.execv` без crash'ей.
 
-Возвращаем структурированный результат с диффом коммитов и списком
-изменённых файлов, чтобы UI мог показать changelog.
+Все шаги обёрнуты в try/except — обновление не должно ронять приложение.
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,6 +33,8 @@ class UpdateResult:
     changed_files: list[str] = field(default_factory=list)
     needs_restart: bool = False
     raw_output: str = ""
+    stashed: bool = False         # были ли локальные правки и спрятаны в stash
+    forced_reset: bool = False    # пришлось ли делать reset --hard
 
 
 @dataclass
@@ -118,13 +128,47 @@ def check_repo(repo_dir: str) -> tuple[bool, str]:
     return True, ""
 
 
-def pull(repo_dir: str, remote: str = "origin", branch: str | None = None) -> UpdateResult:
-    """Выполняет git pull --ff-only и формирует структурированный результат."""
+def pull(repo_dir: str, remote: str = "origin", branch: str | None = None,
+         force: bool = False) -> UpdateResult:
+    """Обновляет рабочую копию из remote.
+
+    Args:
+        repo_dir: путь к git-репозиторию.
+        remote: имя remote, по умолчанию origin.
+        branch: ветка, по умолчанию текущая.
+        force: если True — стэшим локальные правки и при невозможности
+            fast-forward делаем reset --hard.
+    """
     result = UpdateResult()
 
-    ok, err = check_repo(repo_dir)
-    if not ok:
-        result.error = err
+    if not os.path.isdir(repo_dir):
+        result.error = f"Каталог не существует: {repo_dir}"
+        return result
+    if not os.path.exists(os.path.join(repo_dir, ".git")):
+        result.error = f"Это не git-репозиторий: {repo_dir}"
+        return result
+
+    # Стэшим локальные правки если force и они есть
+    try:
+        st = _run(["git", "status", "--porcelain"], repo_dir, timeout=10)
+        if st.returncode == 0 and st.stdout.strip():
+            if not force:
+                result.error = ("Есть локальные изменения. Включи «принудительно "
+                                "(stash)» — мы их сохраним в stash перед обновлением.")
+                return result
+            stash_msg = f"akali-auto-{int(time.time())}"
+            stash_proc = _run(
+                ["git", "stash", "push", "-u", "-m", stash_msg],
+                repo_dir, timeout=20,
+            )
+            if stash_proc.returncode == 0:
+                result.stashed = True
+                log.warning("Локальные изменения спрятаны в git stash: %s", stash_msg)
+            else:
+                result.error = f"git stash: {stash_proc.stderr.strip()[:200]}"
+                return result
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        result.error = f"git status: {e}"
         return result
 
     # Текущая ветка
@@ -165,10 +209,27 @@ def pull(repo_dir: str, remote: str = "origin", branch: str | None = None) -> Up
         return result
     result.raw_output = pull_proc.stdout.strip() or pull_proc.stderr.strip()
     if pull_proc.returncode != 0:
-        result.error = (
-            f"git pull вернул код {pull_proc.returncode}: "
-            f"{(pull_proc.stderr or pull_proc.stdout).strip()[:300]}")
-        return result
+        if not force:
+            result.error = (
+                f"git pull --ff-only вернул {pull_proc.returncode}: "
+                f"{(pull_proc.stderr or pull_proc.stdout).strip()[:300]}. "
+                "Включи «принудительно» для reset --hard.")
+            return result
+        # Жёсткий reset на remote-ветку
+        ref = f"{remote}/{branch}"
+        try:
+            reset_proc = _run(["git", "reset", "--hard", ref], repo_dir, timeout=30)
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+            result.error = f"git reset --hard: {e}"
+            return result
+        if reset_proc.returncode != 0:
+            result.error = (
+                f"git reset --hard {ref} вернул {reset_proc.returncode}: "
+                f"{(reset_proc.stderr or reset_proc.stdout).strip()[:300]}")
+            return result
+        result.forced_reset = True
+        result.raw_output = (result.raw_output or "") + "\n" + reset_proc.stdout.strip()
+        log.warning("Выполнен git reset --hard на %s", ref)
 
     # Sha после
     try:

@@ -105,7 +105,6 @@ class ModernHeaderBar(QFrame):
             ("home",     "ГЛАВНАЯ"),
             ("commands", "КОМАНДЫ"),
             ("settings", "НАСТРОЙКИ"),
-            ("log",      "ЛОГ"),
         ]
         for key, label in tabs_config:
             btn = self._make_tab(key, label)

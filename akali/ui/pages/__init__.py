@@ -1,7 +1,6 @@
 """Страницы главного окна — по одной на «вкладку»."""
 from .commands_page import CommandsPage
 from .home_page import HomePage
-from .log_page import LogPage
 from .settings_page import SettingsPage
 
-__all__ = ["HomePage", "CommandsPage", "SettingsPage", "LogPage"]
+__all__ = ["HomePage", "CommandsPage", "SettingsPage"]

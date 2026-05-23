@@ -27,11 +27,15 @@ class _Entry:
 class QueryCache:
     """LRU-кэш: ключ = нормализованный запрос, значение = bash-команда."""
 
-    def __init__(self, cache_file: Path, max_size: int = CACHE_MAX_DEFAULT):
-        self._file = cache_file
+    def __init__(self, cache_file: Path | str, max_size: int = CACHE_MAX_DEFAULT):
+        self._file = Path(cache_file)
         self._max = max_size
         self._data: OrderedDict[str, _Entry] = OrderedDict()
         self._load()
+
+    def save(self) -> None:
+        """Принудительно сохраняет кэш на диск."""
+        self._flush()
 
     # ── public ────────────────────────────────────────────────
     def get(self, query: str) -> str | None:

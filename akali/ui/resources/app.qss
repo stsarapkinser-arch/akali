@@ -267,6 +267,28 @@ QPushButton#runBtn:pressed {
     background: rgba(0, 212, 255, 0.20);
 }
 
+/* === Кнопка удаления (✕) — красная подсветка === */
+QPushButton#dangerBtn {
+    background: transparent;
+    color: #c54a4a;
+    border: none;
+    border-radius: 3px;
+    font-size: 12px;
+    padding: 0px;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+}
+QPushButton#dangerBtn:hover {
+    color: #ff6b6b;
+    background: rgba(255, 80, 80, 0.10);
+}
+QPushButton#dangerBtn:pressed {
+    color: #ff8a8a;
+    background: rgba(255, 80, 80, 0.20);
+}
+
 /* === Пилюли категорий === */
 QPushButton#categoryPill {
     background: transparent;
