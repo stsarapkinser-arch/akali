@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
     reindex_requested = Signal()
     reload_core_requested = Signal()
     update_requested = Signal()
+    check_update_requested = Signal()
     show_requested = Signal()
     quit_requested = Signal()
 
@@ -178,6 +179,7 @@ class MainWindow(QMainWindow):
         self.commands_page.reindex_requested.connect(self.reindex_requested.emit)
         self.settings_page.reload_requested.connect(self.reload_core_requested.emit)
         self.settings_page.update_requested.connect(self.update_requested.emit)
+        self.settings_page.check_update_requested.connect(self.check_update_requested.emit)
 
     @Slot(str)
     def _switch_page(self, key: str) -> None:

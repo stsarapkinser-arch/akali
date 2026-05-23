@@ -27,8 +27,77 @@ class UpdateResult:
     raw_output: str = ""
 
 
+@dataclass
+class VersionInfo:
+    """Текущая версия и информация о доступных обновлениях."""
+    current_sha: str = ""          # полный sha HEAD
+    short_sha: str = ""            # 8 символов
+    branch: str = ""               # текущая ветка
+    commits_behind: int = 0        # сколько коммитов позади remote
+    remote_commits: list[tuple[str, str]] = field(default_factory=list)  # (sha, msg) доступные
+    last_commit_msg: str = ""      # сообщение последнего коммита
+    has_updates: bool = False      # есть ли обновления
+    error: str = ""                # ошибка если не удалось проверить
+    remote_reachable: bool = True  # доступен ли remote
+
+
 def _run(args: list[str], cwd: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def get_version_info(repo_dir: str, remote: str = "origin") -> VersionInfo:
+    """Получает текущую версию и проверяет доступные обновления (только fetch, без pull)."""
+    info = VersionInfo()
+
+    if not os.path.isdir(repo_dir) or not os.path.exists(os.path.join(repo_dir, ".git")):
+        info.error = "Не git-репозиторий"
+        return info
+
+    try:
+        # Текущий SHA и ветка
+        head = _run(["git", "rev-parse", "HEAD"], repo_dir, timeout=5)
+        branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_dir, timeout=5)
+        log = _run(["git", "log", "-1", "--pretty=%s"], repo_dir, timeout=5)
+
+        if head.returncode == 0:
+            info.current_sha = head.stdout.strip()
+            info.short_sha = info.current_sha[:8]
+        if branch.returncode == 0:
+            info.branch = branch.stdout.strip()
+        if log.returncode == 0:
+            info.last_commit_msg = log.stdout.strip()
+
+        # Fetch для проверки обновлений
+        fetch = _run(["git", "fetch", "--prune", remote], repo_dir, timeout=30)
+        if fetch.returncode != 0:
+            info.remote_reachable = False
+            return info
+
+        # Считаем количество коммитов позади
+        ref = f"{remote}/{info.branch}" if info.branch and info.branch != "HEAD" else f"{remote}/main"
+        behind = _run(["git", "rev-list", "--count", f"HEAD..{ref}"], repo_dir, timeout=5)
+        if behind.returncode == 0:
+            try:
+                info.commits_behind = int(behind.stdout.strip())
+            except ValueError:
+                pass
+
+        # Список доступных коммитов
+        if info.commits_behind > 0:
+            info.has_updates = True
+            new_commits = _run(
+                ["git", "log", "--pretty=format:%h\t%s", f"HEAD..{ref}"],
+                repo_dir, timeout=10)
+            if new_commits.returncode == 0:
+                for line in new_commits.stdout.splitlines():
+                    sha, _, msg = line.partition("\t")
+                    if sha:
+                        info.remote_commits.append((sha.strip(), msg.strip()))
+
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        info.error = str(e)
+
+    return info
 
 
 def check_repo(repo_dir: str) -> tuple[bool, str]:

@@ -24,9 +24,28 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 from . import paths
 from .core.audio_worker import AudioWorker
 from .core.backend import AssistantCore
-from .core.updater import UpdateResult, pull as git_pull
+from .core.updater import UpdateResult, VersionInfo, pull as git_pull, get_version_info
 from .ui.main_window import MainWindow
 from .ui.tray import TrayController
+
+
+# ============================================================
+# CheckRunner — проверяет наличие обновлений (только fetch)
+# ============================================================
+class CheckRunner(QObject):
+    finished = Signal(object)  # VersionInfo
+
+    def __init__(self, repo_dir: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self._repo_dir = repo_dir
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            info = get_version_info(self._repo_dir)
+        except Exception as e:  # noqa: BLE001
+            info = VersionInfo(error=f"Неожиданная ошибка: {e}")
+        self.finished.emit(info)
 
 
 # ============================================================
@@ -91,6 +110,10 @@ class AkaliApp(QObject):
         self._update_thread: QThread | None = None
         self._update_runner: UpdateRunner | None = None
 
+        # === Check worker (только fetch, без pull) ===
+        self._check_thread: QThread | None = None
+        self._check_runner: CheckRunner | None = None
+
         # === Resource poll timer ===
         self._resource_timer = QTimer(self)
         self._resource_timer.setInterval(2000)
@@ -149,6 +172,7 @@ class AkaliApp(QObject):
         w.reindex_requested.connect(a.request_reindex)
         w.reload_core_requested.connect(self._reload_core)
         w.update_requested.connect(self.run_update)
+        w.check_update_requested.connect(self.run_check)
         w.show_requested.connect(self.show_window)
         w.quit_requested.connect(self.quit)
         w.settings_page.device_changed.connect(a.set_device)
@@ -267,9 +291,46 @@ class AkaliApp(QObject):
 
     # ------------------------------------------------------------
     @Slot()
+    def run_check(self) -> None:
+        """Проверяет наличие обновлений (только fetch, без pull)."""
+        if self._check_thread and self._check_thread.isRunning():
+            return
+        if self._update_thread and self._update_thread.isRunning():
+            return
+        repo = self._window.settings_page.repo_dir or self._repo_dir
+        self._window.log_page.append(f"🔍 Проверка обновлений в {repo}…")
+        thread = QThread()
+        runner = CheckRunner(repo)
+        runner.moveToThread(thread)
+        thread.started.connect(runner.run)
+        runner.finished.connect(self._on_check_finished)
+        runner.finished.connect(thread.quit)
+        runner.finished.connect(runner.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._check_thread = thread
+        self._check_runner = runner
+        thread.start()
+
+    @Slot(object)
+    def _on_check_finished(self, info: VersionInfo) -> None:
+        self._window.settings_page.on_version_info(info)
+        self._check_thread = None
+        self._check_runner = None
+        if info.has_updates:
+            self._window.log_page.append(
+                f"⬇ Доступно {info.commits_behind} новых коммитов")
+        elif not info.error:
+            self._window.log_page.append("✓ Версия актуальна")
+        else:
+            self._window.log_page.append(f"⚠ Проверка обновлений: {info.error}")
+
+    @Slot()
     def run_update(self) -> None:
         if self._update_thread and self._update_thread.isRunning():
             self._window.log_page.append("⏳ Обновление уже выполняется…")
+            return
+        if self._check_thread and self._check_thread.isRunning():
+            self._window.log_page.append("⏳ Дождись завершения проверки…")
             return
         repo = self._window.settings_page.repo_dir or self._repo_dir
         self._window.log_page.append(f"⏳ git pull в {repo}…")
@@ -288,6 +349,7 @@ class AkaliApp(QObject):
     @Slot(object)
     def _on_update_finished(self, result: UpdateResult) -> None:
         self._window.on_update_result(result)
+        self._window.settings_page.on_update_result(result)
         self._update_thread = None
         self._update_runner = None
 

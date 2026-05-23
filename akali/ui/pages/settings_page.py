@@ -12,11 +12,225 @@ from __future__ import annotations
 from PySide6.QtCore import QSettings, Qt, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
-                                QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                                QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+                                QHBoxLayout, QLabel, QLineEdit, QProgressBar,
+                                QPushButton, QScrollArea, QSizePolicy,
+                                QTextEdit, QVBoxLayout, QWidget)
 
 from ...core.backend import AssistantCore
 from ...core.audio_worker import list_input_devices
+from ...core.updater import UpdateResult, VersionInfo
+
+
+class UpdatePanel(QFrame):
+    """Полноценная панель обновления прямо в настройках.
+
+    Отображает:
+      • Текущий SHA + ветку
+      • Статус (актуально / N новых коммитов)
+      • Список доступных коммитов (changelog)
+      • Прогресс-бар во время операции
+      • Лог результата
+    """
+
+    check_requested = Signal()
+    update_requested = Signal()
+
+    def __init__(self, repo_dir: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._repo_dir = repo_dir
+        self._busy = False
+        self.setObjectName("updatePanel")
+        self.setFrameShape(QFrame.NoFrame)
+        self._build()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        # ── Текущая версия ──────────────────────────────────────
+        ver_row = QHBoxLayout()
+        ver_row.setSpacing(10)
+
+        self._lbl_sha = QLabel("SHA: —")
+        self._lbl_sha.setStyleSheet("color: #8B949E; font-size: 10px;")
+        ver_row.addWidget(self._lbl_sha)
+
+        self._lbl_branch = QLabel("branch: —")
+        self._lbl_branch.setStyleSheet(
+            "color: #00D4FF; font-size: 10px; font-weight: bold;")
+        ver_row.addWidget(self._lbl_branch)
+        ver_row.addStretch()
+        layout.addLayout(ver_row)
+
+        # ── Статус обновлений ───────────────────────────────────
+        self._lbl_status = QLabel("Нажми «Проверить» для поиска обновлений")
+        self._lbl_status.setWordWrap(True)
+        self._lbl_status.setStyleSheet(
+            "color: #8B949E; font-size: 10px; padding: 6px; "
+            "background-color: #161B22; border-radius: 4px;")
+        layout.addWidget(self._lbl_status)
+
+        # ── Changelog (новые коммиты) ───────────────────────────
+        self._changelog = QTextEdit()
+        self._changelog.setObjectName("changelog")
+        self._changelog.setReadOnly(True)
+        self._changelog.setVisible(False)
+        self._changelog.setMaximumHeight(130)
+        self._changelog.setStyleSheet("""
+            QTextEdit#changelog {
+                background-color: #0D1117;
+                color: #3FB950;
+                font-size: 9px;
+                font-family: "JetBrains Mono", monospace;
+                border: 1px solid #30363D;
+                border-radius: 4px;
+                padding: 6px;
+            }
+        """)
+        layout.addWidget(self._changelog)
+
+        # ── Прогресс-бар ────────────────────────────────────────
+        self._progress = QProgressBar()
+        self._progress.setObjectName("updateProgress")
+        self._progress.setRange(0, 0)   # indeterminate
+        self._progress.setVisible(False)
+        self._progress.setMaximumHeight(6)
+        self._progress.setTextVisible(False)
+        self._progress.setStyleSheet("""
+            QProgressBar#updateProgress {
+                background-color: #30363D;
+                border: none;
+                border-radius: 3px;
+            }
+            QProgressBar#updateProgress::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00D4FF, stop:1 #1D8EE6);
+                border-radius: 3px;
+            }
+        """)
+        layout.addWidget(self._progress)
+
+        # ── Кнопки ─────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self._btn_check = QPushButton("🔍  Проверить")
+        self._btn_check.setObjectName("secondaryBtn")
+        self._btn_check.setMinimumHeight(34)
+        self._btn_check.setCursor(Qt.PointingHandCursor)
+        self._btn_check.clicked.connect(self._on_check_clicked)
+        btn_row.addWidget(self._btn_check)
+
+        self._btn_update = QPushButton("⬇  Обновить")
+        self._btn_update.setObjectName("primaryBtn")
+        self._btn_update.setMinimumHeight(34)
+        self._btn_update.setCursor(Qt.PointingHandCursor)
+        self._btn_update.setEnabled(False)
+        self._btn_update.setVisible(False)
+        self._btn_update.clicked.connect(self._on_update_clicked)
+        btn_row.addWidget(self._btn_update)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.setLayout(layout)
+
+    # ── Публичные слоты ─────────────────────────────────────────
+    @Slot(object)
+    def on_version_info(self, info: VersionInfo) -> None:
+        """Вызывается после проверки обновлений."""
+        self._set_busy(False)
+
+        if info.short_sha:
+            self._lbl_sha.setText(f"SHA: {info.short_sha}")
+        if info.branch:
+            self._lbl_branch.setText(f"⎇  {info.branch}")
+
+        if info.error:
+            self._set_status(f"⚠ Ошибка: {info.error}", "#F85149")
+            return
+
+        if not info.remote_reachable:
+            self._set_status("⚠ Нет доступа к remote. Проверь сеть.", "#D29922")
+            return
+
+        if not info.has_updates:
+            self._set_status("✓ Версия актуальна", "#3FB950")
+            self._btn_update.setVisible(False)
+            self._changelog.setVisible(False)
+            return
+
+        # Есть обновления — показываем changelog
+        count = info.commits_behind
+        self._set_status(
+            f"⬇ Доступно {count} {'коммит' if count == 1 else 'коммита' if count < 5 else 'коммитов'}",
+            "#D29922")
+
+        lines = [f"  {sha}  {msg}" for sha, msg in info.remote_commits]
+        self._changelog.setPlainText("\n".join(lines))
+        self._changelog.setVisible(True)
+
+        self._btn_update.setEnabled(True)
+        self._btn_update.setVisible(True)
+
+    @Slot(object)
+    def on_update_result(self, result: UpdateResult) -> None:
+        """Вызывается после выполнения git pull."""
+        self._set_busy(False)
+        self._btn_update.setVisible(False)
+        self._changelog.setVisible(False)
+
+        if not result.ok:
+            self._set_status(f"✕ Ошибка обновления: {result.error}", "#F85149")
+            return
+
+        if result.already_up_to_date:
+            self._set_status("✓ Уже последняя версия", "#3FB950")
+            return
+
+        count = len(result.pulled_commits)
+        lines = [f"  {sha}  {msg}" for sha, msg in result.pulled_commits]
+        self._changelog.setPlainText("\n".join(lines))
+        self._changelog.setVisible(True)
+
+        restart_note = "  ⚠ Перезапусти приложение" if result.needs_restart else ""
+        self._set_status(
+            f"✓ Обновлено: +{count} коммитов{restart_note}",
+            "#3FB950" if not result.needs_restart else "#D29922")
+
+    def set_repo_dir(self, path: str) -> None:
+        self._repo_dir = path
+
+    # ── Приватные методы ────────────────────────────────────────
+    def _on_check_clicked(self) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._set_status("Проверка обновлений...", "#8B949E")
+        self._changelog.setVisible(False)
+        self._btn_update.setVisible(False)
+        self.check_requested.emit()
+
+    def _on_update_clicked(self) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._set_status("Загрузка обновлений...", "#00D4FF")
+        self.update_requested.emit()
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._progress.setVisible(busy)
+        self._btn_check.setEnabled(not busy)
+        self._btn_update.setEnabled(not busy)
+        self._btn_check.setText("⏳  Проверка..." if busy else "🔍  Проверить")
+
+    def _set_status(self, text: str, color: str) -> None:
+        self._lbl_status.setText(text)
+        self._lbl_status.setStyleSheet(
+            f"color: {color}; font-size: 10px; padding: 6px; "
+            "background-color: #161B22; border-radius: 4px; font-weight: bold;")
 
 
 def _section_label(text: str) -> QLabel:
@@ -59,6 +273,7 @@ class SettingsPage(QWidget):
     """Все настройки в одной скроллируемой колонке."""
 
     update_requested = Signal()
+    check_update_requested = Signal()
     reload_requested = Signal()
     device_changed = Signal(object)  # int|None — индекс устройства
 
@@ -133,9 +348,10 @@ class SettingsPage(QWidget):
         llm_card.add(_form_row("Gemini API", self._edit_gemini_key))
         col.addWidget(llm_card)
 
-        # === Репозиторий =====================================
+        # === Репозиторий + Обновление =============================
         repo_card = _Card()
-        repo_card.add(_section_label("РЕПОЗИТОРИЙ"))
+        repo_card.add(_section_label("РЕПОЗИТОРИЙ И ОБНОВЛЕНИЕ"))
+
         self._edit_repo = QLineEdit(self._repo_dir)
         repo_row = QHBoxLayout()
         repo_row.setContentsMargins(0, 0, 0, 0)
@@ -149,11 +365,13 @@ class SettingsPage(QWidget):
         wrap = QWidget()
         wrap.setLayout(repo_row)
         repo_card.add(_form_row("Папка", wrap))
-        self._btn_update = QPushButton("Обновить из репо (git pull)")
-        self._btn_update.setObjectName("secondaryBtn")
-        self._btn_update.setCursor(Qt.PointingHandCursor)
-        self._btn_update.clicked.connect(self.update_requested.emit)
-        repo_card.add(self._btn_update)
+
+        # Полноценная панель обновления
+        self._update_panel = UpdatePanel(self._repo_dir)
+        self._update_panel.check_requested.connect(self.check_update_requested.emit)
+        self._update_panel.update_requested.connect(self.update_requested.emit)
+        repo_card.add(self._update_panel)
+
         col.addWidget(repo_card)
 
         # === Действия ========================================
@@ -242,6 +460,16 @@ class SettingsPage(QWidget):
         s.setValue("repo_dir", self._edit_repo.text().strip() or self._repo_dir)
         self._repo_dir = self._edit_repo.text().strip() or self._repo_dir
         self.reload_requested.emit()
+
+    @Slot(object)
+    def on_version_info(self, info: VersionInfo) -> None:
+        """Передаём результат проверки обновлений в панель обновления."""
+        self._update_panel.on_version_info(info)
+
+    @Slot(object)
+    def on_update_result(self, result: UpdateResult) -> None:
+        """Передаём результат git pull в панель обновления."""
+        self._update_panel.on_update_result(result)
 
     @property
     def repo_dir(self) -> str:
