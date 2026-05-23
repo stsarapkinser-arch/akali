@@ -5,16 +5,20 @@
     2. `espeak-ng -v ru+f3` — фоллбэк для машин без piper.
     3. Тихий no-op, если ни того ни другого нет.
 
-Все вызовы — неблокирующие: текст складывается в очередь и
-проигрывается фоновым потоком. Прерывание (`stop`) останавливает текущее
-проигрывание сразу.
+Архитектура:
+    • Все say() — неблокирующие: фраза кладётся в очередь, воркер играет.
+    • Прогрев: при старте генерируем .wav файлы для COMMON_PHRASES и
+      кэшируем в ~/.cache/akali/tts/. Кэш привязан к движку + voice mtime
+      (если голос обновили — кэш инвалидируется).
+    • say(text) сначала ищет кэш-файл; если есть — играем мгновенно через
+      paplay/pw-play/aplay. Иначе синтезируем налету.
 
-ВАЖНО: НЕ озвучиваем сами bash-команды (там может быть rm -rf или
-другая чувствительная инфа). Озвучиваем только короткие подтверждения
-типа «Выполнено», «Не понял», «Запускаю».
+ВАЖНО: НЕ озвучиваем сами bash-команды (там может быть rm -rf или другая
+чувствительная инфа). Только короткие подтверждения.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
@@ -22,11 +26,45 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from . import system_check
 
 log = logging.getLogger(__name__)
+
+
+# ── Прогреваемые фразы ==================================================
+# Часто используемые ответы — кэшируются как WAV при первом старте,
+# чтобы reproduction был мгновенным.
+COMMON_PHRASES: tuple[str, ...] = (
+    "Понял, выполняю",
+    "Запускаю",
+    "Сделано",
+    "Готово",
+    "Не понял команду",
+    "Команда заблокирована",
+    "Выполняю команду питания",
+    "Перезапускаюсь",
+    "Ошибка выполнения",
+    "Команды нет в базе",
+    "Жду команду",
+)
+
+
+def _cache_dir() -> Path:
+    """Возвращает ~/.cache/akali/tts/, создавая директорию."""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or
+                Path.home() / ".cache")
+    d = base / "akali" / "tts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cache_key(engine_name: str, voice_signature: str, text: str) -> str:
+    h = hashlib.sha1(
+        f"{engine_name}|{voice_signature}|{text}".encode("utf-8")
+    ).hexdigest()[:16]
+    return h
 
 
 # ── Движки ==============================================================
@@ -38,7 +76,16 @@ class _Engine:
     def available(self) -> bool:
         return False
 
-    def speak(self, text: str) -> None:  # noqa: D401
+    def voice_signature(self) -> str:
+        """Уникальный отпечаток голоса (для инвалидации кэша)."""
+        return self.name
+
+    def synthesize_wav(self, text: str, dest: Path) -> bool:
+        """Синтезирует фразу в WAV-файл. True если успех."""
+        return False
+
+    def speak(self, text: str) -> None:
+        """Синхронно произносит текст (для streaming-режима, не из кэша)."""
         return None
 
     def stop(self) -> None:
@@ -59,24 +106,48 @@ class _PiperEngine(_Engine):
             return False
         if not self.voice.exists():
             return False
-        # Нужен либо aplay (alsa), либо paplay (pulse), либо pw-play (pipewire)
-        return bool(shutil.which("aplay") or shutil.which("paplay") or shutil.which("pw-play"))
+        return bool(_audio_player_cmd())
 
-    def _player_cmd(self) -> list[str] | None:
-        for cmd in (
-            ["pw-play", "-"],                       # PipeWire
-            ["paplay", "--raw", "--rate=22050",     # PulseAudio (raw 22 kHz PCM)
-             "--format=s16le", "--channels=1"],
-            ["aplay", "-r", "22050", "-f", "S16_LE", "-c", "1"],
-        ):
-            if shutil.which(cmd[0]):
-                return cmd
-        return None
+    def voice_signature(self) -> str:
+        try:
+            return f"piper:{self.voice.stat().st_mtime_ns}"
+        except OSError:
+            return "piper:no-voice"
+
+    def synthesize_wav(self, text: str, dest: Path) -> bool:
+        """piper --output_file dest.wav. Без стрима — чистый WAV."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".wav.part")
+        try:
+            proc = subprocess.run(
+                ["piper", "--model", str(self.voice),
+                 "--output_file", str(tmp), "--quiet"],
+                input=text.encode("utf-8"),
+                capture_output=True, timeout=20,
+            )
+            if proc.returncode != 0:
+                log.debug("piper synthesize rc=%d: %s", proc.returncode,
+                          proc.stderr[:200].decode(errors="ignore"))
+                tmp.unlink(missing_ok=True)
+                return False
+            if not tmp.exists() or tmp.stat().st_size < 100:
+                tmp.unlink(missing_ok=True)
+                return False
+            os.replace(tmp, dest)
+            return True
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.debug("piper synthesize error: %s", e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
     def speak(self, text: str) -> None:
-        player = self._player_cmd()
+        """Стрим: piper --output_raw | paplay --raw."""
+        player = _audio_raw_player_cmd()
         if player is None:
-            log.debug("piper: нет проигрывателя (pw-play/paplay/aplay)")
+            log.debug("piper: нет проигрывателя сырого PCM")
             return
         try:
             with self._lock:
@@ -125,12 +196,39 @@ class _EspeakEngine(_Engine):
     def available(self) -> bool:
         return bool(shutil.which("espeak-ng") or shutil.which("espeak"))
 
+    def voice_signature(self) -> str:
+        return f"espeak:{self.voice}"
+
+    def _bin(self) -> str:
+        return "espeak-ng" if shutil.which("espeak-ng") else "espeak"
+
+    def synthesize_wav(self, text: str, dest: Path) -> bool:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".wav.part")
+        try:
+            proc = subprocess.run(
+                [self._bin(), "-v", self.voice, "-s", "165", "-p", "55",
+                 "--punct=", "-w", str(tmp), "--", text],
+                capture_output=True, timeout=20,
+            )
+            if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size < 100:
+                tmp.unlink(missing_ok=True)
+                return False
+            os.replace(tmp, dest)
+            return True
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.debug("espeak synthesize error: %s", e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
     def speak(self, text: str) -> None:
-        bin_name = "espeak-ng" if shutil.which("espeak-ng") else "espeak"
         try:
             with self._lock:
                 self._proc = subprocess.Popen(
-                    [bin_name, "-v", self.voice, "-s", "165",
+                    [self._bin(), "-v", self.voice, "-s", "165",
                      "-p", "55", "--punct=", "--", text],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
@@ -151,6 +249,48 @@ class _EspeakEngine(_Engine):
             self._proc = None
 
 
+# ── Хелперы аудио ======================================================
+def _audio_player_cmd() -> list[str] | None:
+    """Команда для проигрывания WAV-файла. Принимает путь как arg."""
+    for cmd in (
+        ["paplay"],
+        ["pw-play"],
+        ["aplay", "-q"],
+    ):
+        if shutil.which(cmd[0]):
+            return cmd
+    return None
+
+
+def _audio_raw_player_cmd() -> list[str] | None:
+    """Команда для проигрывания сырого PCM 22050 Hz s16le mono со стандартного входа."""
+    for cmd in (
+        ["pw-play", "-"],
+        ["paplay", "--raw", "--rate=22050",
+         "--format=s16le", "--channels=1"],
+        ["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-c", "1"],
+    ):
+        if shutil.which(cmd[0]):
+            return cmd
+    return None
+
+
+def _play_wav(path: Path) -> None:
+    """Проигрывает готовый WAV-файл, не возвращается пока не доиграется."""
+    player = _audio_player_cmd()
+    if player is None:
+        log.debug("нет аудио-плеера для %s", path)
+        return
+    try:
+        subprocess.run(
+            [*player, str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.debug("WAV play error: %s", e)
+
+
 def _select_engine(prefer: str = "auto") -> _Engine:
     """Выбирает доступный движок по приоритету."""
     if prefer != "espeak":
@@ -166,7 +306,7 @@ def _select_engine(prefer: str = "auto") -> _Engine:
 
 # ── Сервис ==============================================================
 class TextToSpeech:
-    """Очередь озвучек с фоновым потоком-проигрывателем."""
+    """Очередь озвучек с фоновым потоком и WAV-прекэшем частых фраз."""
 
     def __init__(self, enabled: bool = True, prefer: str = "auto"):
         self._enabled = enabled
@@ -175,6 +315,7 @@ class TextToSpeech:
         self._queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=16)
         self._worker: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
+        self._cache_lock = threading.Lock()
         if self._engine.name != "none":
             log.info("TTS: использую движок %r", self._engine.name)
         else:
@@ -214,7 +355,6 @@ class TextToSpeech:
         """Кладёт фразу в очередь, не блокируя поток."""
         if not self.is_enabled() or not text.strip():
             return
-        # Безопасность: вырезаем подозрительные технические символы из речи.
         cleaned = _clean_for_speech(text)
         if not cleaned:
             return
@@ -243,6 +383,44 @@ class TextToSpeech:
             self._worker.join(timeout=2.0)
         self._engine.stop()
 
+    # ── Прекэш ════════════════════════════════════════════════════════
+    def prewarm(self, phrases: Iterable[str] = COMMON_PHRASES,
+                blocking: bool = False) -> None:
+        """Генерирует WAV-файлы для частых фраз. По умолчанию — фоном."""
+        if not self.is_enabled():
+            log.debug("TTS prewarm пропущен: движок недоступен")
+            return
+        if blocking:
+            self._prewarm_run(list(phrases))
+        else:
+            threading.Thread(
+                target=self._prewarm_run, args=(list(phrases),),
+                name="akali-tts-prewarm", daemon=True,
+            ).start()
+
+    def _prewarm_run(self, phrases: list[str]) -> None:
+        log.info("TTS: прогреваю кэш на %d фраз (%s)…",
+                 len(phrases), self._engine.name)
+        ok = 0
+        for ph in phrases:
+            cleaned = _clean_for_speech(ph)
+            if not cleaned:
+                continue
+            path = self._cache_path(cleaned)
+            if path.exists() and path.stat().st_size > 100:
+                ok += 1
+                continue
+            with self._cache_lock:
+                if self._engine.synthesize_wav(cleaned, path):
+                    ok += 1
+        log.info("TTS: прогрев готов (%d/%d фраз закэшировано в %s)",
+                 ok, len(phrases), _cache_dir())
+
+    def _cache_path(self, text: str) -> Path:
+        key = _cache_key(self._engine.name,
+                         self._engine.voice_signature(), text)
+        return _cache_dir() / f"{key}.wav"
+
     # ── internals ──────────────────────────────────────────────────────
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -262,9 +440,21 @@ class TextToSpeech:
             if item is None:
                 break
             try:
+                # Сначала — кэш
+                cached = self._cache_path(item)
+                if cached.exists() and cached.stat().st_size > 100:
+                    _play_wav(cached)
+                    continue
+                # Иначе синтез на лету. Параллельно пишем в кэш, чтобы
+                # следующий раз был мгновенным.
+                if self._engine.name in ("piper", "espeak-ng"):
+                    if self._engine.synthesize_wav(item, cached):
+                        _play_wav(cached)
+                        continue
+                # Фоллбэк на стрим
                 self._engine.speak(item)
             except Exception as e:  # noqa: BLE001
-                log.warning("TTS sayback error: %s", e)
+                log.warning("TTS playback error: %s", e)
 
 
 _FORBIDDEN_PREFIX = ("sudo", "rm ", "dd ", "mkfs", "/dev/")
@@ -276,8 +466,7 @@ def _clean_for_speech(text: str) -> str:
     lower = text.lower()
     if any(lower.startswith(p) for p in _FORBIDDEN_PREFIX):
         return ""
-    # Срезаем самые шумные символы: |, &, ;, > и т.п.
     for ch in "|&;<>`$\\":
         text = text.replace(ch, " ")
     text = " ".join(text.split())
-    return text[:140]   # длиннее не озвучиваем
+    return text[:140]

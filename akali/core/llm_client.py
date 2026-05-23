@@ -174,19 +174,16 @@ class GeminiClient:
         return bool(self._api_key)
 
     def _get_client(self):
+        """Создаёт клиента google-genai (новая библиотека, не deprecated)."""
         if self._client is None:
             try:
-                import google.generativeai as genai  # noqa: WPS433
-                genai.configure(api_key=self._api_key)
-                self._client = genai.GenerativeModel(
-                    model_name=self.model,
-                    system_instruction=SYSTEM_PROMPT,
-                )
+                from google import genai  # type: ignore  # noqa: WPS433
             except ImportError as e:
                 raise RuntimeError(
-                    "google-generativeai не установлен. "
-                    "pip install google-generativeai"
+                    "google-genai не установлен. "
+                    "pip install google-genai"
                 ) from e
+            self._client = genai.Client(api_key=self._api_key)
         return self._client
 
     def query(self, text: str) -> Optional[str]:
@@ -194,9 +191,14 @@ class GeminiClient:
             return None
         try:
             client = self._get_client()
-            resp = client.generate_content(
-                text,
-                generation_config={"temperature": 0, "max_output_tokens": 128},
+            resp = client.models.generate_content(
+                model=self.model,
+                contents=text,
+                config={
+                    "system_instruction": SYSTEM_PROMPT,
+                    "temperature": 0,
+                    "max_output_tokens": 128,
+                },
             )
             return _strip_fences(getattr(resp, "text", "") or "") or None
         except Exception as e:  # noqa: BLE001

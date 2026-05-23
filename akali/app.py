@@ -97,8 +97,35 @@ class SystemCheckRunner(QObject):
         except Exception as e:  # noqa: BLE001
             log.error("system_check упал: %s", e)
             report = system_check.SystemReport(
-                checks=[system_check.CheckResult(
+                items=[system_check.CheckResult(
                     "system_check", False, f"исключение: {e}", False)])
+        self.finished.emit(report)
+
+
+# ============================================================
+# AutoInstallRunner — на старте: проверяет всё и доставляет
+# безопасные компоненты (pip-пакеты, vosk-модель, голос piper)
+# ============================================================
+class AutoInstallRunner(QObject):
+    progress = Signal(str)
+    finished = Signal(object)  # SystemReport (после второй проверки)
+
+    def __init__(self, gemini_key: str | None, parent: QObject | None = None):
+        super().__init__(parent)
+        self._gemini_key = gemini_key
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            report = system_check.auto_install_safe(
+                api_key=self._gemini_key,
+                progress=self.progress.emit,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.error("auto_install_safe упал: %s", e)
+            report = system_check.SystemReport(
+                items=[system_check.CheckResult(
+                    "auto_install_safe", False, f"исключение: {e}", False)])
         self.finished.emit(report)
 
 
@@ -176,6 +203,8 @@ class AkaliApp(QObject):
         self._sys_check_runner: SystemCheckRunner | None = None
         self._gemini_test_thread: QThread | None = None
         self._gemini_test_runner: GeminiTestRunner | None = None
+        self._auto_install_thread: QThread | None = None
+        self._auto_install_runner: AutoInstallRunner | None = None
 
         # === Resource poll timer ===
         self._resource_timer = QTimer(self)
@@ -192,6 +221,10 @@ class AkaliApp(QObject):
         self._update_resources()
         self._resource_timer.start()
         self._apply_auto_update_setting(int(self._settings.value("auto_update_minutes", 0) or 0))
+
+        # === Старт автоустановки безопасных компонентов в фоне.
+        # Сразу же — но через event-loop, чтобы UI успел отрисоваться.
+        QTimer.singleShot(200, self._kickoff_auto_install)
 
     # ------------------------------------------------------------
     def _restore_core_settings(self) -> None:
@@ -530,13 +563,72 @@ class AkaliApp(QObject):
     @Slot(object)
     def _on_system_check_done(self, report) -> None:
         lines = []
-        for cr in report.checks:
-            mark = "✓" if cr.ok else "✕"
+        for cr in report.items:
+            mark = "✓" if cr.ok else ("⚠" if cr.fixable else "✕")
             lines.append(f"{mark} {cr.name}: {cr.message}")
         system_check.print_report(report)
         self._window.settings_page.show_check_result(lines)
         self._sys_check_thread = None
         self._sys_check_runner = None
+
+    # ── Авто-установка на старте + прогрев TTS ──────────────
+    @Slot()
+    def _kickoff_auto_install(self) -> None:
+        """Запускает фоновую проверку и доустановку безопасного.
+        После завершения — пересоздаёт TTS и прогревает кэш фраз.
+        """
+        if self._auto_install_thread and self._auto_install_thread.isRunning():
+            return
+        api_key = str(self._settings.value("gemini_api_key", "") or "").strip() or None
+        log.info("Старт фоновой автопроверки компонентов…")
+        thread = QThread()
+        runner = AutoInstallRunner(api_key)
+        runner.moveToThread(thread)
+        thread.started.connect(runner.run)
+        runner.progress.connect(self._on_auto_install_progress)
+        runner.finished.connect(self._on_auto_install_done)
+        runner.finished.connect(thread.quit)
+        runner.finished.connect(runner.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._auto_install_thread = thread
+        self._auto_install_runner = runner
+        thread.start()
+
+    @Slot(str)
+    def _on_auto_install_progress(self, message: str) -> None:
+        try:
+            self._window.home_page.show_toast(message[:80])
+        except Exception:  # noqa: BLE001
+            pass
+
+    @Slot(object)
+    def _on_auto_install_done(self, report) -> None:
+        try:
+            n_missing = sum(1 for it in report.items if not it.ok)
+            log.info("Автопроверка готова: %d/%d компонентов в порядке",
+                     len(report.items) - n_missing, len(report.items))
+        except Exception:  # noqa: BLE001
+            pass
+        self._auto_install_thread = None
+        self._auto_install_runner = None
+
+        # Если piper или espeak только что появились — пересоздать TTS
+        try:
+            from .core.tts import TextToSpeech as _TTS  # avoid circular
+            prev_engine = self._tts.engine_name
+            tts_enabled = str(self._settings.value("tts_enabled", "true")).lower() in ("1", "true", "yes")
+            tts_voice = str(self._settings.value("tts_voice", "auto") or "auto")
+            self._tts = _TTS(enabled=tts_enabled, prefer=tts_voice)
+            if self._tts.engine_name != prev_engine:
+                log.info("TTS: движок обновился %r → %r", prev_engine, self._tts.engine_name)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не удалось пересоздать TTS: %s", e)
+
+        # Прогреваем кэш частых фраз (фон, без блокировки)
+        try:
+            self._tts.prewarm(blocking=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("TTS prewarm не запущен: %s", e)
 
     # ── Click-to-run из CommandsPage ────────────────────────
     @Slot(str)
