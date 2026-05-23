@@ -138,8 +138,11 @@ def setup(level: int | None = None) -> None:
     root.addHandler(handler)
     root.setLevel(level)
 
-    # Шумные библиотеки придушить
-    for noisy in ("urllib3", "google", "httpx", "hpack"):
+    # Шумные библиотеки придушить.
+    # google-genai в новой версии логирует "AFC is enabled with max remote calls"
+    # на каждом запросе через 'google_genai.models' — заткнём.
+    for noisy in ("urllib3", "google", "google_genai", "google_genai.models",
+                  "httpx", "hpack", "filelock", "fastembed"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Сразу же устанавливаем глобальные защиты от необработанных исключений.

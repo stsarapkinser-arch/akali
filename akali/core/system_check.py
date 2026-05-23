@@ -46,12 +46,29 @@ log = logging.getLogger(__name__)
 # === Артефакты, к которым привязаны проверки ============================
 OLLAMA_MODEL = "qwen2.5-coder:1.5b"
 
+# Голос Piper по умолчанию — мужской русский «Дмитрий» (в духе Джарвиса).
+# Доступные альтернативы: ru_RU-{dmitri,ruslan,denis}-medium (мужские),
+# ru_RU-irina-medium (женский).
+PIPER_DEFAULT_VOICE = "ru_RU-dmitri-medium"
 PIPER_VOICE_DIR = paths.PROJECT_ROOT / "voices"
-PIPER_VOICE_FILE = PIPER_VOICE_DIR / "ru_RU-irina-medium.onnx"
-PIPER_VOICE_JSON = PIPER_VOICE_DIR / "ru_RU-irina-medium.onnx.json"
-PIPER_VOICE_URL_BASE = (
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium"
-)
+
+
+def _piper_voice_paths(voice: str = PIPER_DEFAULT_VOICE) -> tuple[Path, Path, str]:
+    """Возвращает (.onnx, .onnx.json, base_url) для имени голоса вроде
+    'ru_RU-dmitri-medium'."""
+    lang, speaker, quality = voice.split("-", 2)
+    lang_short = lang.split("_")[0]  # ru_RU → ru
+    base_url = (
+        f"https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+        f"{lang_short}/{lang}/{speaker}/{quality}"
+    )
+    onnx = PIPER_VOICE_DIR / f"{voice}.onnx"
+    onnx_json = PIPER_VOICE_DIR / f"{voice}.onnx.json"
+    return onnx, onnx_json, base_url
+
+
+# Кэшированные пути для дефолтного голоса (используются в check/install ниже)
+PIPER_VOICE_FILE, PIPER_VOICE_JSON, PIPER_VOICE_URL_BASE = _piper_voice_paths()
 
 VOSK_MODEL_NAME = "vosk-model-small-ru-0.22"
 VOSK_MODEL_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL_NAME}.zip"
@@ -110,6 +127,50 @@ def _emit(progress: Optional[ProgressFn], msg: str) -> None:
             progress(msg)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _has_pkexec_gui() -> bool:
+    """Доступен ли pkexec И графическая сессия с polkit-агентом.
+    pkexec без агента просто молча упадёт — поэтому проверяем DISPLAY/WAYLAND."""
+    if not shutil.which("pkexec"):
+        return False
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return True
+
+
+def _pkexec_run(argv: list[str], progress: Optional[ProgressFn],
+                title: str, timeout: float = 600.0) -> tuple[bool, str]:
+    """Запускает команду через pkexec (показывает GUI-промпт пароля).
+    Возвращает (успех, stderr_tail).
+
+    pkexec exit codes:
+      0   — команда выполнена успешно
+      126 — пользователь не авторизован / не нажал OK
+      127 — pkexec не нашёл программу или ошибка polkit
+      other — exit-код самой команды
+    """
+    if not _has_pkexec_gui():
+        return False, ("нет графической сессии или pkexec — "
+                       "ставь вручную через sudo")
+    _emit(progress, f"🔐 {title} (откроется окно с запросом пароля)…")
+    try:
+        proc = subprocess.run(
+            ["pkexec"] + argv,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "превышен таймаут установки"
+    except OSError as e:
+        return False, f"pkexec упал: {e}"
+    if proc.returncode == 126:
+        return False, "отмена пользователем / не введён пароль"
+    if proc.returncode == 127:
+        return False, "polkit-агент не отвечает / нет правил"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-300:]
+        return False, f"код {proc.returncode}: {tail}"
+    return True, ""
 
 
 def _download(url: str, dest: Path, progress: Optional[ProgressFn] = None,
@@ -195,11 +256,14 @@ def check_ollama_binary() -> CheckResult:
     if shutil.which("ollama"):
         return CheckResult("Ollama (бинарь)", True, "в PATH",
                            fixable=False, auto_safe=False)
-    # ollama install требует sudo — не auto_safe
+    # ollama install требует sudo — но в графической сессии вызовем pkexec
+    safe = _has_pkexec_gui()
+    note = ("установлю через pkexec (запросит пароль)" if safe else
+            "поставь вручную: curl -fsSL https://ollama.com/install.sh | sh")
     return CheckResult(
         "Ollama (бинарь)", False,
-        "не установлен. Скачать с https://ollama.com/install.sh (требует sudo).",
-        fixable=True, auto_safe=False,
+        f"не установлен. {note}.",
+        fixable=True, auto_safe=safe,
     )
 
 
@@ -242,30 +306,34 @@ def check_piper_binary() -> CheckResult:
 
 
 def check_piper_voice() -> CheckResult:
-    missing = []
-    if not PIPER_VOICE_FILE.exists():
-        missing.append(PIPER_VOICE_FILE.name)
-    if not PIPER_VOICE_JSON.exists():
-        missing.append(PIPER_VOICE_JSON.name)
-    if missing:
-        return CheckResult(
-            "Piper голос (ru-irina)", False,
-            f"не найден: {', '.join(missing)}. Будет скачан (~60 МБ).",
-            fixable=True, auto_safe=True,
-        )
-    return CheckResult("Piper голос (ru-irina)", True,
-                       f"{PIPER_VOICE_FILE.name} готов",
-                       fixable=False, auto_safe=False)
+    """Проверяет, что есть дефолтный мужской русский голос dmitri.
+    Если установлен только женский (irina) — всё равно качаем dmitri,
+    т.к. дефолт для Akali — мужской («Джарвис»). Юзер потом сможет
+    переключиться в Настройках."""
+    if not PIPER_VOICE_DIR.exists():
+        PIPER_VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    if PIPER_VOICE_FILE.exists() and PIPER_VOICE_JSON.exists():
+        return CheckResult(f"Piper голос ({PIPER_DEFAULT_VOICE})", True,
+                           f"{PIPER_VOICE_FILE.name} готов",
+                           fixable=False, auto_safe=False)
+    return CheckResult(
+        f"Piper голос ({PIPER_DEFAULT_VOICE})", False,
+        f"не найден. Будет скачан {PIPER_DEFAULT_VOICE} (~60 МБ).",
+        fixable=True, auto_safe=True,
+    )
 
 
 def check_espeak() -> CheckResult:
     if shutil.which("espeak-ng") or shutil.which("espeak"):
         return CheckResult("espeak-ng (фоллбэк TTS)", True, "в PATH",
                            fixable=False, auto_safe=False)
+    safe = _has_pkexec_gui()
+    note = ("установлю через pkexec apt (запросит пароль)" if safe else
+            "поставь вручную: sudo apt install espeak-ng")
     return CheckResult(
         "espeak-ng (фоллбэк TTS)", False,
-        "не установлен. Поставь: sudo apt install espeak-ng (требует sudo).",
-        fixable=True, auto_safe=False,
+        f"не установлен. {note}.",
+        fixable=True, auto_safe=safe,
     )
 
 
@@ -366,7 +434,8 @@ def run_all_checks(gemini_api_key: str | None = None) -> SystemReport:
     # Модели и движки
     report.items.append(_safe(check_vosk_model, "Vosk модель"))
     report.items.append(_safe(check_piper_binary, "Piper (бинарь)"))
-    report.items.append(_safe(check_piper_voice, "Piper голос (ru-irina)"))
+    report.items.append(_safe(check_piper_voice,
+                              f"Piper голос ({PIPER_DEFAULT_VOICE})"))
     report.items.append(_safe(check_espeak, "espeak-ng"))
     report.items.append(_safe(check_ollama_binary, "Ollama (бинарь)"))
     report.items.append(_safe(check_ollama_model,
@@ -378,16 +447,25 @@ def run_all_checks(gemini_api_key: str | None = None) -> SystemReport:
 
 
 def print_report(report: SystemReport) -> None:
-    """Печатает отчёт человеческим языком в stdout."""
-    log.info("=== Проверка зависимостей Akali ===")
+    """Печатает отчёт человеческим языком."""
+    n_ok = sum(1 for it in report.items if it.ok)
+    n_total = len(report.items)
+    log.info("─── Проверка: %d из %d компонентов на месте ───", n_ok, n_total)
     for item in report.items:
         prefix = "✓" if item.ok else ("⚠" if item.fixable else "✗")
         log.info("  %s %s — %s", prefix, item.name, item.message)
     n_fix = report.fixable_count
     n_auto = report.auto_safe_count
     if n_fix:
-        log.info("Можно установить кнопкой «Установить недостающее»: %d (из них без sudo: %d)",
-                 n_fix, n_auto)
+        if n_auto == n_fix:
+            log.info("Можно поставить автоматически: %d штук(а).", n_fix)
+        elif n_auto > 0:
+            log.info("Можно поставить автоматически %d из %d (остальные — "
+                     "поставь сам, sudo / большие скачивания).",
+                     n_auto, n_fix)
+        else:
+            log.info("Установка требует ручного вмешательства: %d штук(а).",
+                     n_fix)
 
 
 # ── Установки (auto_safe=True) ==========================================
@@ -411,8 +489,8 @@ def install_pip_package(pip_name: str,
     if not in_venv:
         cmd.append("--user")
     cmd += ["--quiet", "--disable-pip-version-check", pip_name]
-    _emit(progress,
-          f"pip install {'(venv)' if in_venv else '--user'} {pip_name}…")
+    where = "в venv" if in_venv else "в --user"
+    _emit(progress, f"📦 pip {where}: {pip_name}…")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -437,7 +515,7 @@ def install_pip_package(pip_name: str,
         user_site = site.getusersitepackages()
         if user_site and user_site not in sys.path:
             sys.path.insert(0, user_site)
-    _emit(progress, f"Установлен {pip_name}.")
+    _emit(progress, f"✓ {pip_name} установлен.")
     return CheckResult(f"pip: {pip_name}", True, "установлен",
                        fixable=False, auto_safe=False)
 
@@ -486,35 +564,63 @@ def install_vosk_model(progress: Optional[ProgressFn] = None) -> CheckResult:
                        fixable=False, auto_safe=False)
 
 
-def install_piper_voice(progress: Optional[ProgressFn] = None) -> CheckResult:
-    """Скачивает голос ru_RU-irina-medium (.onnx + .onnx.json)."""
+def install_piper_voice(progress: Optional[ProgressFn] = None,
+                        voice: str = PIPER_DEFAULT_VOICE) -> CheckResult:
+    """Скачивает голос Piper (.onnx + .onnx.json).
+    По умолчанию — мужской русский dmitri (близкий к Джарвису по тембру)."""
     PIPER_VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    onnx_path, json_path, url_base = _piper_voice_paths(voice)
     targets = [
-        (PIPER_VOICE_FILE, f"{PIPER_VOICE_URL_BASE}/ru_RU-irina-medium.onnx"),
-        (PIPER_VOICE_JSON, f"{PIPER_VOICE_URL_BASE}/ru_RU-irina-medium.onnx.json"),
+        (onnx_path, f"{url_base}/{voice}.onnx"),
+        (json_path, f"{url_base}/{voice}.onnx.json"),
     ]
+    _emit(progress, f"Качаю голос {voice} (~60 МБ)…")
     for dest, url in targets:
         if dest.exists():
             continue
         if not _download(url, dest, progress):
-            return CheckResult("Piper голос (ru-irina)", False,
+            return CheckResult(f"Piper голос ({voice})", False,
                                f"не удалось скачать {dest.name}",
                                fixable=True, auto_safe=True)
-    return CheckResult("Piper голос (ru-irina)", True, "голос ru-irina готов",
+    _emit(progress, f"✓ голос {voice} готов.")
+    return CheckResult(f"Piper голос ({voice})", True, f"голос {voice} готов",
+                       fixable=False, auto_safe=False)
+
+
+def install_espeak_ng(progress: Optional[ProgressFn] = None) -> CheckResult:
+    """Ставит espeak-ng через pkexec apt (graphical password prompt)."""
+    if shutil.which("espeak-ng") or shutil.which("espeak"):
+        return CheckResult("espeak-ng (фоллбэк TTS)", True, "уже установлен",
+                           fixable=False, auto_safe=False)
+    # apt-get install в один шаг с -y для тишины
+    ok, err = _pkexec_run(
+        ["apt-get", "install", "-y", "espeak-ng"],
+        progress,
+        title="Устанавливаю espeak-ng",
+        timeout=300,
+    )
+    if not ok:
+        return CheckResult("espeak-ng (фоллбэк TTS)", False,
+                           f"не удалось: {err}",
+                           fixable=True, auto_safe=False)
+    _emit(progress, "✓ espeak-ng установлен.")
+    return CheckResult("espeak-ng (фоллбэк TTS)", True, "установлен",
                        fixable=False, auto_safe=False)
 
 
 def install_ollama(progress: Optional[ProgressFn] = None) -> CheckResult:
-    """Запускает официальный installer Ollama (требует sudo!)."""
+    """Качает install.sh от ollama и запускает через pkexec.
+    Скрипт сам сделает useradd/systemd, поэтому pkexec нужен.
+    """
     if shutil.which("ollama"):
         return CheckResult("Ollama (бинарь)", True, "уже установлен",
                            fixable=False, auto_safe=False)
     if not shutil.which("curl"):
         return CheckResult("Ollama (бинарь)", False,
                            "нужен curl", fixable=False, auto_safe=False)
-    _emit(progress, "Скачиваю официальный installer Ollama…")
+    _emit(progress, "Качаю официальный installer Ollama…")
+    installer = paths.PROJECT_ROOT / ".ollama-install.sh"
     try:
-        installer = paths.PROJECT_ROOT / ".ollama-install.sh"
         proc = subprocess.run(
             ["curl", "-fsSL", "-o", str(installer),
              "https://ollama.com/install.sh"],
@@ -522,22 +628,32 @@ def install_ollama(progress: Optional[ProgressFn] = None) -> CheckResult:
         )
         if proc.returncode != 0:
             return CheckResult("Ollama (бинарь)", False,
-                               f"curl вернул {proc.returncode}",
+                               f"curl: {proc.stderr.decode(errors='replace')[:200]}",
                                fixable=True, auto_safe=False)
-        _emit(progress, "Запускаю installer (потребуется sudo)…")
-        proc = subprocess.run(["sh", str(installer)], timeout=600)
-        installer.unlink(missing_ok=True)
-        if proc.returncode != 0:
-            return CheckResult("Ollama (бинарь)", False,
-                               f"installer вернул {proc.returncode}",
-                               fixable=True, auto_safe=False)
-        _emit(progress, "Ollama установлен.")
-        return CheckResult("Ollama (бинарь)", True, "установлен",
-                           fixable=False, auto_safe=False)
+        # Делаем installer читаемым для всех (pkexec бежит как root, но
+        # скрипт читает себя из FS)
+        os.chmod(installer, 0o755)
+        ok, err = _pkexec_run(
+            ["sh", str(installer)], progress,
+            title="Устанавливаю Ollama (~200 МБ)", timeout=900,
+        )
     except (subprocess.TimeoutExpired, OSError) as e:
+        installer.unlink(missing_ok=True)
         return CheckResult("Ollama (бинарь)", False,
                            f"ошибка установки: {e}",
                            fixable=True, auto_safe=False)
+    installer.unlink(missing_ok=True)
+    if not ok:
+        return CheckResult("Ollama (бинарь)", False,
+                           f"не удалось: {err}",
+                           fixable=True, auto_safe=False)
+    if not shutil.which("ollama"):
+        return CheckResult("Ollama (бинарь)", False,
+                           "после установки ollama не в PATH — проверь /usr/local/bin",
+                           fixable=True, auto_safe=False)
+    _emit(progress, "✓ Ollama установлен.")
+    return CheckResult("Ollama (бинарь)", True, "установлен",
+                       fixable=False, auto_safe=False)
 
 
 def pull_ollama_model(progress: Optional[ProgressFn] = None) -> CheckResult:
@@ -586,7 +702,8 @@ def install_missing(report: SystemReport,
     results: list[CheckResult] = []
     fixers: dict[str, Callable[[Optional[ProgressFn]], CheckResult]] = {
         "Vosk модель": install_vosk_model,
-        "Piper голос (ru-irina)": install_piper_voice,
+        f"Piper голос ({PIPER_DEFAULT_VOICE})": install_piper_voice,
+        "espeak-ng (фоллбэк TTS)": install_espeak_ng,
         "Ollama (бинарь)": install_ollama,
         f"Ollama модель {OLLAMA_MODEL}": pull_ollama_model,
     }
@@ -603,7 +720,7 @@ def install_missing(report: SystemReport,
         fix = fixers.get(item.name)
         if fix is None:
             continue
-        _emit(progress, f"→ Чиню: {item.name}")
+        _emit(progress, f"⚙  Ставлю «{item.name}»…")
         try:
             results.append(fix(progress))
         except Exception as e:  # noqa: BLE001
@@ -627,7 +744,7 @@ def auto_install_safe(api_key: str | None = None,
         print_report(report)
         if report.auto_safe_count == 0:
             return report
-        log.info("Доустанавливаю %d безопасных компонента(ов)…",
+        log.info("Сейчас доставлю %d компонент(а) автоматически…",
                  report.auto_safe_count)
         install_missing(report, progress=progress, only_auto_safe=True)
         # Перепроверяем — статусы могли поменяться

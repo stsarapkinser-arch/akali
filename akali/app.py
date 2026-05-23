@@ -174,7 +174,13 @@ class AkaliApp(QObject):
         # === TTS ===
         tts_enabled = str(self._settings.value("tts_enabled", "true")).lower() in ("1", "true", "yes")
         tts_voice = str(self._settings.value("tts_voice", "auto") or "auto")
-        self._tts = TextToSpeech(enabled=tts_enabled, prefer=tts_voice)
+        tts_piper_voice = str(self._settings.value(
+            "tts_piper_voice", system_check.PIPER_DEFAULT_VOICE,
+        ) or system_check.PIPER_DEFAULT_VOICE)
+        self._tts = TextToSpeech(
+            enabled=tts_enabled, prefer=tts_voice,
+            piper_voice=tts_piper_voice,
+        )
 
         # === Safety notifier ===
         safety.set_notifier(self._on_safety_violation)
@@ -596,11 +602,13 @@ class AkaliApp(QObject):
         self.run_check()
 
     # ── TTS / Safety / Gemini test / system_check ───────────
-    @Slot(bool, str)
-    def _on_tts_settings_changed(self, enabled: bool, voice: str) -> None:
+    @Slot(bool, str, str)
+    def _on_tts_settings_changed(self, enabled: bool, voice: str,
+                                  piper_voice: str) -> None:
         self._tts.set_enabled(enabled)
-        self._tts.set_voice(voice)
-        log.info("TTS: enabled=%s, voice=%s", enabled, voice)
+        self._tts.set_voice(voice, piper_voice=piper_voice or None)
+        log.info("TTS: enabled=%s, engine=%s, голос=%s",
+                 enabled, voice, piper_voice)
 
     def _on_safety_violation(self, source: str, command: str, reason: str) -> None:
         """Callback от safety.report — показывает уведомление."""
@@ -725,7 +733,13 @@ class AkaliApp(QObject):
             prev_engine = self._tts.engine_name
             tts_enabled = str(self._settings.value("tts_enabled", "true")).lower() in ("1", "true", "yes")
             tts_voice = str(self._settings.value("tts_voice", "auto") or "auto")
-            new_tts = _TTS(enabled=tts_enabled, prefer=tts_voice)
+            tts_piper_voice = str(self._settings.value(
+                "tts_piper_voice", system_check.PIPER_DEFAULT_VOICE,
+            ) or system_check.PIPER_DEFAULT_VOICE)
+            new_tts = _TTS(
+                enabled=tts_enabled, prefer=tts_voice,
+                piper_voice=tts_piper_voice,
+            )
             old_tts = self._tts
             self._tts = new_tts
             try:

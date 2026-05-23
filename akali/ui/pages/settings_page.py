@@ -117,6 +117,15 @@ class UpdatePanel(QFrame):
     def force(self) -> bool:
         return self._chk_force.isChecked()
 
+    def _set_status(self, text: str, color: str = "#8B949E") -> None:
+        """Обновляет статусную метку с цветом. Раньше это был метод,
+        потом исчез при рефакторинге — кнопка «Проверить» падала с
+        AttributeError. Восстанавливаем."""
+        self._lbl_status.setText(text)
+        self._lbl_status.setStyleSheet(
+            f"color: {color}; font-size: 10px; padding: 6px; "
+            "background-color: #161B22; border-radius: 4px;")
+
     @Slot(object)
     def on_version_info(self, info: VersionInfo) -> None:
         self._set_busy(False)
@@ -237,7 +246,7 @@ class SettingsPage(QWidget):
     reload_requested = Signal()
     device_changed = Signal(object)        # int|None
     auto_update_changed = Signal(int)      # минуты (0 = выкл.)
-    tts_settings_changed = Signal(bool, str)   # enabled, voice ("piper" / "espeak" / "off")
+    tts_settings_changed = Signal(bool, str, str)   # enabled, engine, piper_voice
     gemini_test_requested = Signal(str)    # API key для теста
     system_check_requested = Signal()
 
@@ -309,10 +318,24 @@ class SettingsPage(QWidget):
         tts_card.add(self._chk_tts_enabled)
         self._cmb_tts_voice = QComboBox()
         self._cmb_tts_voice.addItem("auto (piper если есть, иначе espeak)", "auto")
-        self._cmb_tts_voice.addItem("piper (ru_RU-irina-medium)", "piper")
+        self._cmb_tts_voice.addItem("piper (нейронный, мужской/женский ru)", "piper")
         self._cmb_tts_voice.addItem("espeak-ng (резерв)", "espeak")
+        self._cmb_tts_voice.addItem("выключить", "off")
         self._cmb_tts_voice.setMinimumHeight(28)
         tts_card.add(_form_row("Движок", self._cmb_tts_voice))
+
+        # Селектор голоса Piper. dmitri = мужской в духе джарвиса.
+        self._cmb_piper_voice = QComboBox()
+        self._cmb_piper_voice.addItem("Дмитрий (мужской, спокойный — Джарвис)",
+                                       "ru_RU-dmitri-medium")
+        self._cmb_piper_voice.addItem("Руслан (мужской, низкий)",
+                                       "ru_RU-ruslan-medium")
+        self._cmb_piper_voice.addItem("Денис (мужской, нейтральный)",
+                                       "ru_RU-denis-medium")
+        self._cmb_piper_voice.addItem("Ирина (женский)",
+                                       "ru_RU-irina-medium")
+        self._cmb_piper_voice.setMinimumHeight(28)
+        tts_card.add(_form_row("Голос Piper", self._cmb_piper_voice))
         col.addWidget(tts_card)
 
         # ── Репозиторий + обновление ────────────────────
@@ -423,6 +446,12 @@ class SettingsPage(QWidget):
         idx = self._cmb_tts_voice.findData(voice)
         if idx >= 0:
             self._cmb_tts_voice.setCurrentIndex(idx)
+        piper_voice = str(s.value(
+            "tts_piper_voice", "ru_RU-dmitri-medium",
+        ) or "ru_RU-dmitri-medium")
+        idx = self._cmb_piper_voice.findData(piper_voice)
+        if idx >= 0:
+            self._cmb_piper_voice.setCurrentIndex(idx)
         # Auto-update
         try:
             self._spin_auto_update.setValue(int(s.value("auto_update_minutes", 0) or 0))
@@ -448,9 +477,12 @@ class SettingsPage(QWidget):
         # TTS
         tts_on = self._chk_tts_enabled.isChecked()
         voice = self._cmb_tts_voice.currentData() or "auto"
+        piper_voice = (self._cmb_piper_voice.currentData()
+                        or "ru_RU-dmitri-medium")
         s.setValue("tts_enabled", "true" if tts_on else "false")
         s.setValue("tts_voice", voice)
-        self.tts_settings_changed.emit(tts_on, voice)
+        s.setValue("tts_piper_voice", piper_voice)
+        self.tts_settings_changed.emit(tts_on, voice, piper_voice)
 
         # Auto-update interval
         minutes = int(self._spin_auto_update.value())

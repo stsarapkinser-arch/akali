@@ -1,8 +1,8 @@
 """Озвучка ответов ассистента приятным человеческим голосом.
 
 Приоритет движков:
-    1. `piper` (нейронный, оффлайн, голос ru_RU-irina-medium) — основной.
-    2. `espeak-ng -v ru+f3` — фоллбэк для машин без piper.
+    1. `piper` (нейронный, оффлайн, мужской голос ru_RU-dmitri-medium «Джарвис») — основной.
+    2. `espeak-ng -v ru+m3` — фоллбэк для машин без piper.
     3. Тихий no-op, если ни того ни другого нет.
 
 Архитектура:
@@ -92,11 +92,29 @@ class _Engine:
         return None
 
 
+def _find_piper_voice(prefer_name: Optional[str] = None) -> Optional[Path]:
+    """Возвращает .onnx файл голоса для piper.
+    1. Если задано prefer_name (например 'ru_RU-dmitri-medium') — он.
+    2. Иначе — дефолт из system_check (dmitri).
+    3. Если ни одно не существует — любой ru_RU-*-medium.onnx.
+    """
+    voices_dir = system_check.PIPER_VOICE_DIR
+    if prefer_name:
+        candidate = voices_dir / f"{prefer_name}.onnx"
+        if candidate.exists():
+            return candidate
+    if system_check.PIPER_VOICE_FILE.exists():
+        return system_check.PIPER_VOICE_FILE
+    for alt in voices_dir.glob("ru_RU-*-medium.onnx"):
+        return alt
+    return None
+
+
 class _PiperEngine(_Engine):
     name = "piper"
 
-    def __init__(self, voice: Path = system_check.PIPER_VOICE_FILE):
-        self.voice = voice
+    def __init__(self, voice_name: Optional[str] = None):
+        self.voice = _find_piper_voice(voice_name)
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._aplay: Optional[subprocess.Popen[bytes]] = None
         self._lock = threading.Lock()
@@ -104,13 +122,15 @@ class _PiperEngine(_Engine):
     def available(self) -> bool:
         if not shutil.which("piper"):
             return False
-        if not self.voice.exists():
+        if self.voice is None or not self.voice.exists():
             return False
         return bool(_audio_player_cmd())
 
     def voice_signature(self) -> str:
+        if self.voice is None:
+            return "piper:no-voice"
         try:
-            return f"piper:{self.voice.stat().st_mtime_ns}"
+            return f"piper:{self.voice.name}:{self.voice.stat().st_mtime_ns}"
         except OSError:
             return "piper:no-voice"
 
@@ -188,7 +208,9 @@ class _PiperEngine(_Engine):
 class _EspeakEngine(_Engine):
     name = "espeak-ng"
 
-    def __init__(self, voice: str = "ru+f3"):
+    def __init__(self, voice: str = "ru+m3"):
+        # m3 = мужской голос (близко к Джарвису, в духе мужского piper).
+        # f3 был старым дефолтом, но user попросил мужской.
         self.voice = voice
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._lock = threading.Lock()
@@ -291,10 +313,15 @@ def _play_wav(path: Path) -> None:
         log.debug("WAV play error: %s", e)
 
 
-def _select_engine(prefer: str = "auto") -> _Engine:
-    """Выбирает доступный движок по приоритету."""
+def _select_engine(prefer: str = "auto",
+                    piper_voice: Optional[str] = None) -> _Engine:
+    """Выбирает доступный движок по приоритету.
+    prefer ∈ {auto, piper, espeak, off}.
+    piper_voice — имя голоса для piper, например 'ru_RU-dmitri-medium'."""
+    if prefer == "off":
+        return _Engine()
     if prefer != "espeak":
-        piper = _PiperEngine()
+        piper = _PiperEngine(voice_name=piper_voice)
         if piper.available():
             return piper
     if prefer != "piper":
@@ -308,10 +335,12 @@ def _select_engine(prefer: str = "auto") -> _Engine:
 class TextToSpeech:
     """Очередь озвучек с фоновым потоком и WAV-прекэшем частых фраз."""
 
-    def __init__(self, enabled: bool = True, prefer: str = "auto"):
+    def __init__(self, enabled: bool = True, prefer: str = "auto",
+                  piper_voice: Optional[str] = None):
         self._enabled = enabled
         self._prefer = prefer
-        self._engine: _Engine = _select_engine(prefer)
+        self._piper_voice = piper_voice
+        self._engine: _Engine = _select_engine(prefer, piper_voice)
         self._queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=16)
         self._worker: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
@@ -333,11 +362,16 @@ class TextToSpeech:
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
 
-    def set_voice(self, prefer: str) -> None:
-        """Переключает движок налету (auto/piper/espeak/off)."""
-        if prefer == self._prefer:
+    def set_voice(self, prefer: str,
+                  piper_voice: Optional[str] = None) -> None:
+        """Переключает движок налету (auto/piper/espeak/off).
+        Если piper_voice указан, переключает голос Piper в т.ч. на лету.
+        """
+        if prefer == self._prefer and piper_voice == self._piper_voice:
             return
         self._prefer = prefer
+        if piper_voice is not None:
+            self._piper_voice = piper_voice
         if prefer == "off":
             self._engine = _Engine()
             return
@@ -345,8 +379,12 @@ class TextToSpeech:
             self._engine.stop()
         except Exception:  # noqa: BLE001
             pass
-        self._engine = _select_engine(prefer)
-        log.info("TTS: переключён движок → %r", self._engine.name)
+        self._engine = _select_engine(prefer, self._piper_voice)
+        if self._engine.name == "piper" and isinstance(self._engine, _PiperEngine):
+            log.info("TTS: голос Piper → %s",
+                     self._engine.voice.name if self._engine.voice else "?")
+        else:
+            log.info("TTS: переключён движок → %r", self._engine.name)
 
     def is_enabled(self) -> bool:
         return self.enabled

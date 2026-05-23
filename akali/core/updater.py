@@ -56,7 +56,10 @@ def _run(args: list[str], cwd: str, timeout: float = 60.0) -> subprocess.Complet
 
 
 def get_version_info(repo_dir: str, remote: str = "origin") -> VersionInfo:
-    """Получает текущую версию и проверяет доступные обновления (только fetch, без pull)."""
+    """Получает текущую версию и проверяет доступные обновления (только fetch, без pull).
+
+    Никогда не raise наружу — любая ошибка попадает в info.error.
+    """
     info = VersionInfo()
 
     if not os.path.isdir(repo_dir) or not os.path.exists(os.path.join(repo_dir, ".git")):
@@ -106,6 +109,12 @@ def get_version_info(repo_dir: str, remote: str = "origin") -> VersionInfo:
 
     except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
         info.error = str(e)
+    except Exception as e:  # noqa: BLE001
+        # Любая прочая неожиданная проблема (например, git выдал не-UTF8) —
+        # не валим UI, а возвращаем ошибку текстом.
+        log.error("get_version_info: неожиданное исключение: %s", e,
+                  exc_info=True)
+        info.error = f"внутренняя ошибка: {e}"
 
     return info
 
@@ -138,7 +147,20 @@ def pull(repo_dir: str, remote: str = "origin", branch: str | None = None,
         branch: ветка, по умолчанию текущая.
         force: если True — стэшим локальные правки и при невозможности
             fast-forward делаем reset --hard.
+
+    ВАЖНО: эта функция НИКОГДА не должна raise наружу. Все возможные
+    проблемы возвращаются через UpdateResult.error.
     """
+    try:
+        return _pull_impl(repo_dir, remote, branch, force)
+    except Exception as e:  # noqa: BLE001
+        log.error("Updater.pull упал с неожиданным исключением: %s", e,
+                  exc_info=True)
+        return UpdateResult(ok=False, error=f"внутренняя ошибка: {e}")
+
+
+def _pull_impl(repo_dir: str, remote: str, branch: str | None,
+               force: bool) -> UpdateResult:
     result = UpdateResult()
 
     if not os.path.isdir(repo_dir):
