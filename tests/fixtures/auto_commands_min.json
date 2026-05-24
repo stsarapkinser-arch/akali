@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "generated_at": "2026-01-01T00:00:00Z",
+  "sources": {
+    "desktop": 2,
+    "kwin": 0,
+    "binary": 0
+  },
+  "items": [
+    {"command": "konsole", "trigger": "консоль"},
+    {"command": "konsole", "trigger": "терминал"},
+    {"command": "firefox &", "trigger": "браузер от автоматического индексатора"},
+    {"command": "kate", "trigger": "редактор"}
+  ]
+}

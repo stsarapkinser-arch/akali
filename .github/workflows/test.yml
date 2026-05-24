@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "devin/**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y portaudio19-dev espeak-ng git
+
+      - name: Python deps
+        run: pip install -r requirements-dev.txt
+
+      - name: Cache Vosk model
+        uses: actions/cache@v4
+        with:
+          path: model
+          key: vosk-small-ru-0.22
+
+      - name: Smoke (legacy)
+        run: python3 test_smoke.py
+
+      - name: Pytest + coverage
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          pytest tests/ -v --cov --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
