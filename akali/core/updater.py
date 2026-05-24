@@ -1,0 +1,298 @@
+"""Обновление кода ассистента из git-репозитория.
+
+Через UI запускается обновление в директории проекта. Алгоритм:
+  1. Проверяем что это git-репозиторий.
+  2. Если есть локальные правки и пользователь разрешил `force=True` —
+     сохраняем их в stash с пометкой времени (можно потом восстановить),
+     иначе отказываемся.
+  3. `git fetch --prune origin`.
+  4. Пытаемся `git pull --ff-only`. Если fast-forward не получается
+     (расходятся истории) и force=True — `git reset --hard origin/<branch>`.
+  5. Если изменились `.py`/`.qss` — `needs_restart=True`. App.py должен
+     перезапуститься через `os.execv` без crash'ей.
+
+Все шаги обёрнуты в try/except — обновление не должно ронять приложение.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import time
+from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class UpdateResult:
+    ok: bool = False
+    error: str = ""
+    already_up_to_date: bool = False
+    pulled_commits: list[tuple[str, str]] = field(default_factory=list)  # (sha, msg)
+    changed_files: list[str] = field(default_factory=list)
+    needs_restart: bool = False
+    raw_output: str = ""
+    stashed: bool = False         # были ли локальные правки и спрятаны в stash
+    forced_reset: bool = False    # пришлось ли делать reset --hard
+
+
+@dataclass
+class VersionInfo:
+    """Текущая версия и информация о доступных обновлениях."""
+    current_sha: str = ""          # полный sha HEAD
+    short_sha: str = ""            # 8 символов
+    branch: str = ""               # текущая ветка
+    commits_behind: int = 0        # сколько коммитов позади remote
+    remote_commits: list[tuple[str, str]] = field(default_factory=list)  # (sha, msg) доступные
+    last_commit_msg: str = ""      # сообщение последнего коммита
+    has_updates: bool = False      # есть ли обновления
+    error: str = ""                # ошибка если не удалось проверить
+    remote_reachable: bool = True  # доступен ли remote
+
+
+def _run(args: list[str], cwd: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def get_version_info(repo_dir: str, remote: str = "origin") -> VersionInfo:
+    """Получает текущую версию и проверяет доступные обновления (только fetch, без pull).
+
+    Никогда не raise наружу — любая ошибка попадает в info.error.
+    """
+    info = VersionInfo()
+
+    if not os.path.isdir(repo_dir) or not os.path.exists(os.path.join(repo_dir, ".git")):
+        info.error = "Не git-репозиторий"
+        return info
+
+    try:
+        # Текущий SHA и ветка
+        head = _run(["git", "rev-parse", "HEAD"], repo_dir, timeout=5)
+        branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_dir, timeout=5)
+        last_msg = _run(["git", "log", "-1", "--pretty=%s"], repo_dir, timeout=5)
+
+        if head.returncode == 0:
+            info.current_sha = head.stdout.strip()
+            info.short_sha = info.current_sha[:8]
+        if branch.returncode == 0:
+            info.branch = branch.stdout.strip()
+        if last_msg.returncode == 0:
+            info.last_commit_msg = last_msg.stdout.strip()
+
+        # Fetch для проверки обновлений
+        fetch = _run(["git", "fetch", "--prune", remote], repo_dir, timeout=30)
+        if fetch.returncode != 0:
+            info.remote_reachable = False
+            return info
+
+        # Считаем количество коммитов позади
+        ref = f"{remote}/{info.branch}" if info.branch and info.branch != "HEAD" else f"{remote}/main"
+        behind = _run(["git", "rev-list", "--count", f"HEAD..{ref}"], repo_dir, timeout=5)
+        if behind.returncode == 0:
+            try:
+                info.commits_behind = int(behind.stdout.strip())
+            except ValueError:
+                pass
+
+        # Список доступных коммитов
+        if info.commits_behind > 0:
+            info.has_updates = True
+            new_commits = _run(
+                ["git", "log", "--pretty=format:%h\t%s", f"HEAD..{ref}"],
+                repo_dir, timeout=10)
+            if new_commits.returncode == 0:
+                for line in new_commits.stdout.splitlines():
+                    sha, _, msg = line.partition("\t")
+                    if sha:
+                        info.remote_commits.append((sha.strip(), msg.strip()))
+
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        info.error = str(e)
+    except Exception as e:  # noqa: BLE001
+        # Любая прочая неожиданная проблема (например, git выдал не-UTF8) —
+        # не валим UI, а возвращаем ошибку текстом.
+        log.error("get_version_info: неожиданное исключение: %s", e,
+                  exc_info=True)
+        info.error = f"внутренняя ошибка: {e}"
+
+    return info
+
+
+def check_repo(repo_dir: str) -> tuple[bool, str]:
+    """Проверяет, что repo_dir — рабочая копия git без локальных правок."""
+    if not os.path.isdir(repo_dir):
+        return False, f"Каталог не существует: {repo_dir}"
+    git_dir = os.path.join(repo_dir, ".git")
+    if not os.path.exists(git_dir):
+        return False, f"Это не git-репозиторий: {repo_dir}"
+    try:
+        st = _run(["git", "status", "--porcelain"], repo_dir, timeout=10)
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        return False, f"git недоступен: {e}"
+    if st.returncode != 0:
+        return False, f"git status вернул код {st.returncode}: {st.stderr.strip()}"
+    if st.stdout.strip():
+        return False, "Есть локальные несохранённые изменения. Закоммить или спрячь их перед обновлением."
+    return True, ""
+
+
+def pull(repo_dir: str, remote: str = "origin", branch: str | None = None,
+         force: bool = False) -> UpdateResult:
+    """Обновляет рабочую копию из remote.
+
+    Args:
+        repo_dir: путь к git-репозиторию.
+        remote: имя remote, по умолчанию origin.
+        branch: ветка, по умолчанию текущая.
+        force: если True — стэшим локальные правки и при невозможности
+            fast-forward делаем reset --hard.
+
+    ВАЖНО: эта функция НИКОГДА не должна raise наружу. Все возможные
+    проблемы возвращаются через UpdateResult.error.
+    """
+    try:
+        return _pull_impl(repo_dir, remote, branch, force)
+    except Exception as e:  # noqa: BLE001
+        log.error("Updater.pull упал с неожиданным исключением: %s", e,
+                  exc_info=True)
+        return UpdateResult(ok=False, error=f"внутренняя ошибка: {e}")
+
+
+def _pull_impl(repo_dir: str, remote: str, branch: str | None,
+               force: bool) -> UpdateResult:
+    result = UpdateResult()
+
+    if not os.path.isdir(repo_dir):
+        result.error = f"Каталог не существует: {repo_dir}"
+        return result
+    if not os.path.exists(os.path.join(repo_dir, ".git")):
+        result.error = f"Это не git-репозиторий: {repo_dir}"
+        return result
+
+    # Стэшим локальные правки если force и они есть
+    try:
+        st = _run(["git", "status", "--porcelain"], repo_dir, timeout=10)
+        if st.returncode == 0 and st.stdout.strip():
+            if not force:
+                result.error = ("Есть локальные изменения. Включи «принудительно "
+                                "(stash)» — мы их сохраним в stash перед обновлением.")
+                return result
+            stash_msg = f"akali-auto-{int(time.time())}"
+            stash_proc = _run(
+                ["git", "stash", "push", "-u", "-m", stash_msg],
+                repo_dir, timeout=20,
+            )
+            if stash_proc.returncode == 0:
+                result.stashed = True
+                log.warning("Локальные изменения спрятаны в git stash: %s", stash_msg)
+            else:
+                result.error = f"git stash: {stash_proc.stderr.strip()[:200]}"
+                return result
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        result.error = f"git status: {e}"
+        return result
+
+    # Текущая ветка
+    try:
+        head_proc = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_dir, timeout=5)
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        result.error = f"git rev-parse: {e}"
+        return result
+    cur_branch = head_proc.stdout.strip()
+    if not cur_branch or cur_branch == "HEAD":
+        result.error = "HEAD в detached-состоянии — переключись на ветку перед обновлением."
+        return result
+    branch = branch or cur_branch
+
+    # Запоминаем sha до пула
+    try:
+        before_proc = _run(["git", "rev-parse", "HEAD"], repo_dir, timeout=5)
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        result.error = f"git rev-parse HEAD: {e}"
+        return result
+    before_sha = before_proc.stdout.strip()
+
+    # Fetch
+    try:
+        fetch_proc = _run(["git", "fetch", "--prune", remote], repo_dir, timeout=60)
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        result.error = f"git fetch: {e}"
+        return result
+    if fetch_proc.returncode != 0:
+        result.error = f"git fetch вернул код {fetch_proc.returncode}: {fetch_proc.stderr.strip()[:300]}"
+        return result
+
+    # Pull --ff-only
+    try:
+        pull_proc = _run(["git", "pull", "--ff-only", remote, branch], repo_dir, timeout=60)
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        result.error = f"git pull: {e}"
+        return result
+    result.raw_output = pull_proc.stdout.strip() or pull_proc.stderr.strip()
+    if pull_proc.returncode != 0:
+        if not force:
+            result.error = (
+                f"git pull --ff-only вернул {pull_proc.returncode}: "
+                f"{(pull_proc.stderr or pull_proc.stdout).strip()[:300]}. "
+                "Включи «принудительно» для reset --hard.")
+            return result
+        # Жёсткий reset на remote-ветку
+        ref = f"{remote}/{branch}"
+        try:
+            reset_proc = _run(["git", "reset", "--hard", ref], repo_dir, timeout=30)
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+            result.error = f"git reset --hard: {e}"
+            return result
+        if reset_proc.returncode != 0:
+            result.error = (
+                f"git reset --hard {ref} вернул {reset_proc.returncode}: "
+                f"{(reset_proc.stderr or reset_proc.stdout).strip()[:300]}")
+            return result
+        result.forced_reset = True
+        result.raw_output = (result.raw_output or "") + "\n" + reset_proc.stdout.strip()
+        log.warning("Выполнен git reset --hard на %s", ref)
+
+    # Sha после
+    try:
+        after_proc = _run(["git", "rev-parse", "HEAD"], repo_dir, timeout=5)
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        result.error = f"git rev-parse HEAD после pull: {e}"
+        return result
+    after_sha = after_proc.stdout.strip()
+
+    if before_sha == after_sha:
+        result.ok = True
+        result.already_up_to_date = True
+        return result
+
+    # Список новых коммитов
+    try:
+        log_proc = _run(
+            ["git", "log", "--pretty=format:%h%x09%s", f"{before_sha}..{after_sha}"],
+            repo_dir, timeout=10)
+        if log_proc.returncode == 0:
+            for line in log_proc.stdout.splitlines():
+                sha, _, msg = line.partition("\t")
+                if sha:
+                    result.pulled_commits.append((sha, msg.strip()))
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+
+    # Изменённые файлы
+    try:
+        diff_proc = _run(
+            ["git", "diff", "--name-only", f"{before_sha}..{after_sha}"],
+            repo_dir, timeout=10)
+        if diff_proc.returncode == 0:
+            result.changed_files = [
+                f.strip() for f in diff_proc.stdout.splitlines() if f.strip()
+            ]
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+
+    # Если изменились .py / .qss / .json — рестарт нужен
+    restart_exts = (".py", ".qss")
+    result.needs_restart = any(f.endswith(restart_exts) for f in result.changed_files)
+    result.ok = True
+    return result

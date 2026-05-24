@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Konsole
+Name[ru]=Консоль
+GenericName=Terminal
+GenericName[ru]=Терминал
+Comment=Use the command line
+Comment[ru]=Открой терминал
+Exec=konsole
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;

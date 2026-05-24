@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import shlex
 import datetime
 import json
 import os
@@ -94,10 +95,6 @@ def parse_desktop_file(path: str) -> dict | None:
         return None
     if entry.get("Type", "Application").strip().lower() != "application":
         return None
-    if entry.get("Terminal", "false").strip().lower() == "true":
-        # Запуск терминальных приложений требует обёртки konsole -e — пропускаем,
-        # т.к. сходу не знаем, какая Exec-строка корректно стартует через konsole.
-        pass  # не пропускаем, обернём ниже сами
 
     exec_line = entry.get("Exec", "").strip()
     if not exec_line:
@@ -201,7 +198,12 @@ def list_kwin_shortcuts(verbose: bool = True) -> list[dict]:
             continue
         if not name[0].isupper() and " " not in name:
             continue
-        command = f'qdbus org.kde.kglobalaccel /component/kwin invokeShortcut "{name}" &'
+        # Ниже писано бинари найденными (qdbus / qdbus6 / qdbus-qt6), и имя шортката
+        # экранировано shlex.quote — в названиях встречаются спецсимволы/кавычки.
+        command = (
+            f"{shlex.quote(qdbus_bin)} org.kde.kglobalaccel /component/kwin "
+            f"invokeShortcut {shlex.quote(name)} &"
+        )
         trigger = _normalize_trigger(name)
         items.append({
             "command": command,
@@ -319,8 +321,12 @@ def main():
     if not os.path.isabs(output_path):
         output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), output_path)
     try:
-        with open(output_path, "w", encoding="utf-8") as f:
+        # Атомарная запись: в .tmp + os.replace, чтобы прерванный запуск не
+        # оставил порванный JSON.
+        tmp_path = output_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, output_path)
     except OSError as e:
         print(f"❌ Не могу записать {output_path}: {e}", file=sys.stderr)
         return 2

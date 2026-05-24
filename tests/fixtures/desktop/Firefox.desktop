@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Firefox
+Name[ru]=Огненный лис
+GenericName=Web Browser
+GenericName[ru]=Веб-браузер
+Comment=Browse the World Wide Web
+Comment[ru]=Открой браузер
+Exec=firefox %u
+Icon=firefox
+Terminal=false
+Categories=Network;WebBrowser;
