@@ -100,6 +100,12 @@ class Reactor(QWidget):
         # максимума, максимум — заметно крупнее.
         self.setMinimumSize(360, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Прозрачный фон — иначе бывает виден тёмный прямоугольник «подложки»
+        # вокруг круга реактора (системная палитра/QSS), особенно на KDE.
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent;")
         self._angle = 0.0
         self._level = 0.0
         self._level_smooth = 0.0
@@ -204,13 +210,14 @@ class Reactor(QWidget):
 
         # 5. Inner concentric rings (тонкие)
         self._draw_thin_ring(p, cx, cy, r_outer * 0.55, accent, alpha=220, width=2.2)
-        self._draw_thin_ring(p, cx, cy, r_outer * 0.38, accent, alpha=180, width=1.8)
+        self._draw_thin_ring(p, cx, cy, r_outer * 0.42, accent, alpha=190, width=1.8)
 
         # 6. Halo ring вокруг ядра (большая мягкая cyan-«дымка»)
         self._draw_core_halo(p, cx, cy, r_outer * 0.34, accent)
 
-        # 7. Glowing core (главное яркое ядро — крупнее, чем раньше)
-        self._draw_core(p, cx, cy, r_outer * 0.22, accent)
+        # 7. Многослойное ядро (как на референсе: концентрические кольца
+        # с тонким тёмным контуром, яркая cyan-масса и белая точка в центре).
+        self._draw_core(p, cx, cy, r_outer * 0.26, accent)
 
         p.end()
 
@@ -394,36 +401,71 @@ class Reactor(QWidget):
 
     def _draw_core(self, p: QPainter, cx: float, cy: float, r_core: float,
                     accent: QColor) -> None:
-        """Светящееся ядро — яркий белый центр с cyan-аурой.
+        """Многослойная серцевина как на референсе Iron-Man-реактора.
 
-        Само ядро крупнее (см. r_core), сильнее пульсирует от уровня
-        микрофона. Здоровое, «налитое» core.
+        Структура (от внешнего слоя к центру):
+          • bright cyan-белая «масса» ядра с радиальным градиентом
+          • тонкое тёмное contour-кольцо вокруг этой массы (рамка)
+          • внутри — меньший концентрический круг (более яркий)
+          • тонкое тёмное contour-кольцо вокруг внутреннего круга
+          • маленький белый «зрачок» с очень ярким центром
+
+        Размер каждого слоя слегка пульсирует от self._pulse и громкости,
+        но пропорции сохраняются — серцевина всегда выглядит «собранной»,
+        как на референсе.
         """
-        pulse = 0.90 + 0.12 * self._pulse + 0.35 * self._level_smooth
-        actual_r = r_core * min(1.30, pulse)
+        pulse = 0.92 + 0.10 * self._pulse + 0.30 * self._level_smooth
+        actual_r = r_core * min(1.25, pulse)
 
-        # Главная масса ядра: белый центр → накачанный accent → исходный accent
-        core = QRadialGradient(QPointF(cx, cy), actual_r)
-        core.setColorAt(0.00, QColor(255, 255, 255, 255))
-        core.setColorAt(0.28, _rgba(_shift_rgb(accent, 140), 250))
-        core.setColorAt(0.65, _rgba(_shift_rgb(accent, 70), 230))
-        core.setColorAt(1.00, _rgba(accent, 160))
+        # Тёмный цвет «рамок» — приглушённый cyan, почти antrakit-blue.
+        dark_outline = QColor(
+            max(0, accent.red() - 80),
+            max(0, accent.green() - 80),
+            max(0, accent.blue() - 30),
+            235,
+        )
+
+        # === Слой 1: внешняя масса ядра (cyan-белая) ===========================
+        # Радиальный градиент: ярко-белый центр → насыщенный cyan ободок.
+        outer_grad = QRadialGradient(QPointF(cx, cy), actual_r)
+        outer_grad.setColorAt(0.00, QColor(255, 255, 255, 255))
+        outer_grad.setColorAt(0.45, _rgba(_shift_rgb(accent, 120), 250))
+        outer_grad.setColorAt(0.85, _rgba(_shift_rgb(accent, 40), 230))
+        outer_grad.setColorAt(1.00, _rgba(accent, 200))
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(core))
+        p.setBrush(QBrush(outer_grad))
         p.drawEllipse(QPointF(cx, cy), actual_r, actual_r)
 
-        # Тонкое contour-кольцо вокруг ядра (как «зрачок»).
-        contour = _rgba(_shift_rgb(accent, -40), 210)
-        p.setPen(QPen(contour, 1.5))
+        # Тонкое тёмное contour-кольцо вокруг внешней массы.
+        p.setPen(QPen(dark_outline, 1.6))
         p.setBrush(Qt.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), actual_r * 0.92, actual_r * 0.92)
+        p.drawEllipse(QPointF(cx, cy), actual_r, actual_r)
 
-        # Внутреннее «солнце» — крошечное супер-яркое пятно, тоже реагирует
-        # на громкость (становится крупнее от внешних звуков).
-        sun_r = actual_r * (0.38 + 0.10 * self._level_smooth)
+        # === Слой 2: средний концентрический круг ==============================
+        # Меньший круг внутри. На референсе он явно отделён от внешней
+        # массы тонкой тёмной чертой и сам по себе чуть ярче.
+        mid_r = actual_r * 0.62
+        mid_grad = QRadialGradient(QPointF(cx, cy), mid_r)
+        mid_grad.setColorAt(0.00, QColor(255, 255, 255, 255))
+        mid_grad.setColorAt(0.55, _rgba(_shift_rgb(accent, 160), 250))
+        mid_grad.setColorAt(1.00, _rgba(_shift_rgb(accent, 80), 235))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(mid_grad))
+        p.drawEllipse(QPointF(cx, cy), mid_r, mid_r)
+
+        # Тонкое тёмное contour-кольцо вокруг среднего круга.
+        p.setPen(QPen(dark_outline, 1.2))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), mid_r, mid_r)
+
+        # === Слой 3: маленький белый «зрачок» в центре =========================
+        # Размер реагирует на громкость — растёт от внешних звуков.
+        sun_r = actual_r * (0.30 + 0.10 * self._level_smooth)
         sun = QRadialGradient(QPointF(cx, cy), sun_r)
-        sun.setColorAt(0.0, QColor(255, 255, 255, 255))
-        sun.setColorAt(0.55, QColor(255, 255, 255, 190))
-        sun.setColorAt(1.0, QColor(255, 255, 255, 0))
+        sun.setColorAt(0.00, QColor(255, 255, 255, 255))
+        sun.setColorAt(0.40, QColor(255, 255, 255, 240))
+        sun.setColorAt(0.85, _rgba(_shift_rgb(accent, 200), 200))
+        sun.setColorAt(1.00, _rgba(_shift_rgb(accent, 120), 0))
+        p.setPen(Qt.NoPen)
         p.setBrush(QBrush(sun))
         p.drawEllipse(QPointF(cx, cy), sun_r, sun_r)

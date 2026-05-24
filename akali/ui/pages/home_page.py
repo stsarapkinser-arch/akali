@@ -134,17 +134,16 @@ class HomePage(QWidget):
         # stretch=1 — реактор расширяется по высоте до максимума 440.
         outer.addLayout(center, 1)
 
-        # ── Статус + подсказка ──
-        self._state_text = QLabel("")
+        # ── Статус + подсказка (скрыты по запросу — реактор говорит сам за себя) ──
+        # Лейблы остаются в дереве виджетов как пустые / hidden, чтобы
+        # set_state(...) не падал и существующий внешний код не сломался.
+        self._state_text = QLabel("", self)
         self._state_text.setObjectName("bigStatus")
-        self._state_text.setAlignment(Qt.AlignHCenter)
-        outer.addWidget(self._state_text)
+        self._state_text.hide()
 
-        self._hint = QLabel("")
+        self._hint = QLabel("", self)
         self._hint.setObjectName("hint")
-        self._hint.setAlignment(Qt.AlignHCenter)
-        self._hint.setWordWrap(True)
-        outer.addWidget(self._hint)
+        self._hint.hide()
 
         # ── Планка уверенности ──
         conf_row = QHBoxLayout()
