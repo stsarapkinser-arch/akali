@@ -120,15 +120,19 @@ class HomePage(QWidget):
         outer.addStretch(1)
 
         # ── Реактор ──
+        # Реактор увеличен и стал выше, чтобы выглядеть как настоящий
+        # арк-реактор Iron Man (см. референс). По вертикали отдаём ему
+        # столько места, сколько есть.
         center = QHBoxLayout()
         center.addStretch(1)
         self._reactor = Reactor()
-        self._reactor.setMinimumSize(280, 280)
-        self._reactor.setMaximumSize(320, 320)
-        self._reactor.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._reactor.setMinimumSize(360, 360)
+        self._reactor.setMaximumSize(440, 440)
+        self._reactor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         center.addWidget(self._reactor, 0, Qt.AlignHCenter)
         center.addStretch(1)
-        outer.addLayout(center)
+        # stretch=1 — реактор расширяется по высоте до максимума 440.
+        outer.addLayout(center, 1)
 
         # ── Статус + подсказка ──
         self._state_text = QLabel("")

@@ -29,10 +29,10 @@ from .pages import HomePage
 
 log = logging.getLogger(__name__)
 
-WINDOW_WIDTH = 420
-WINDOW_HEIGHT = 720
-WINDOW_MIN_WIDTH = 380
-WINDOW_MIN_HEIGHT = 600
+WINDOW_WIDTH = 480
+WINDOW_HEIGHT = 800
+WINDOW_MIN_WIDTH = 420
+WINDOW_MIN_HEIGHT = 680
 
 
 class MainWindow(QMainWindow):

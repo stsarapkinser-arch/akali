@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import struct
@@ -454,8 +455,23 @@ def _is_noise_text(text: str) -> bool:
     return meaningful == 0
 
 
+# Усиление чувствительности реактора к ambient-шуму. Подобрано так, чтобы
+# шёпот / клавиатура давали ~0.15–0.25, нормальная речь — около 0.55–0.75,
+# громкий звук — близко к 1.0 (но не моментально насыщался).
+_LEVEL_GAIN = 1.55
+_LEVEL_FLOOR = 0.010  # < ~0.010 считаем чистой тишиной (DC-смещение)
+
+
 def _compute_level(data_bytes: bytes) -> float:
-    """Возвращает пиковый уровень микрофона из 16-bit PCM-блока, нормированный 0..1."""
+    """Уровень микрофона 0..1, усиленный для подсветки реактора внешним звуком.
+
+    Объединяет:
+      • peak — быстрая реакция на короткие пики (хлопок, "т-с-с")
+      • RMS  — стабильное восприятие громкости (речь, фон, музыка)
+
+    Затем применяется sqrt-кривая и gain, чтобы даже тихие звуки заметно
+    «оживляли» реактор, при этом громкие пики не выгорали в 1.0 моментально.
+    """
     n = len(data_bytes) // 2
     if n == 0:
         return 0.0
@@ -463,13 +479,24 @@ def _compute_level(data_bytes: bytes) -> float:
         samples = struct.unpack(f"{n}h", data_bytes)
     except struct.error:
         return 0.0
+
     peak = 0
+    sum_sq = 0.0
     for s in samples:
         if s < 0:
             s = -s
         if s > peak:
             peak = s
-    return min(peak / 32768.0, 1.0)
+        sum_sq += s * s
+
+    rms = math.sqrt(sum_sq / n)
+    # peak даёт «отзывчивость», rms даёт «стабильность» — миксуем
+    raw = (peak * 0.55 + rms * 0.45) / 32768.0
+    if raw < _LEVEL_FLOOR:
+        return 0.0
+    # sqrt-компрессия: 0.05 → 0.22, 0.20 → 0.45, 0.50 → 0.71 (× gain далее)
+    boosted = math.sqrt(raw) * _LEVEL_GAIN
+    return min(boosted, 1.0)
 
 
 def list_input_devices() -> list[tuple[int, str, int]]:
