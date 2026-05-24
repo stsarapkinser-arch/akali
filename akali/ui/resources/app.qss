@@ -73,9 +73,15 @@ QPushButton#windowCtrlBtn[close="true"]:hover {
 }
 
 /* === Разделители === */
-QFrame#topSeparator, QFrame#bottomSeparator, QFrame#homeSeparator {
+QFrame#topSeparator, QFrame#bottomSeparator {
     color: #0e1e30;
     background: #0e1e30;
+    max-height: 1px;
+    min-height: 1px;
+}
+QFrame#homeSeparator {
+    color: rgba(0, 212, 255, 0.10);
+    background: rgba(0, 212, 255, 0.10);
     max-height: 1px;
     min-height: 1px;
 }
@@ -110,16 +116,26 @@ QLabel#formLabel {
     font-size: 11px;
 }
 
+/* === HomePage — branding === */
+QLabel#homeBrand {
+    color: #1a4a6a;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+}
+
 /* === HomePage — большой статус === */
 QLabel#bigStatus {
-    color: #e6f7ff;
-    font-size: 18px;
+    color: #00dcff;
+    font-size: 16px;
     font-weight: 700;
     letter-spacing: 6px;
     font-family: "JetBrains Mono", monospace;
+    padding: 2px 0;
 }
 QLabel#hint {
-    color: #4a6a86;
+    color: #3a6080;
     font-size: 11px;
     letter-spacing: 0.5px;
 }
@@ -138,9 +154,16 @@ QLabel#spokenText[partial="true"] {
 
 /* === Confidence bar label === */
 QLabel#confidenceLabel {
-    color: #3a6a8a;
+    color: #4a8aaa;
     font-size: 10px;
     letter-spacing: 1px;
+    font-family: "JetBrains Mono", monospace;
+}
+QLabel#confidenceMethod {
+    color: #2a6080;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 2px;
     font-family: "JetBrains Mono", monospace;
 }
 
@@ -166,15 +189,43 @@ QLabel#llmText {
 
 /* === Toast overlay === */
 QLabel#toastFrame {
-    background-color: rgba(0, 20, 35, 0.92);
-    border: 1px solid rgba(0, 212, 255, 0.45);
-    border-radius: 12px;
+    background-color: rgba(0, 16, 30, 0.94);
+    border: 1px solid rgba(0, 212, 255, 0.35);
+    border-radius: 14px;
     color: #00d4ff;
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 1px;
-    padding: 6px 16px;
+    padding: 8px 20px;
     font-family: "JetBrains Mono", monospace;
+}
+
+/* === Settings gear button on HomePage === */
+QPushButton#settingsGearBtn {
+    background: transparent;
+    border: none;
+    padding: 4px;
+    border-radius: 4px;
+}
+QPushButton#settingsGearBtn:hover {
+    background-color: rgba(0, 212, 255, 0.12);
+}
+
+/* === Back button on SettingsPage === */
+QPushButton#backBtn {
+    background: transparent;
+    color: #00d4ff;
+    border: 1px solid rgba(0, 212, 255, 0.30);
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    padding: 4px 12px;
+    font-family: "JetBrains Mono", monospace;
+}
+QPushButton#backBtn:hover {
+    background-color: rgba(0, 212, 255, 0.12);
+    border-color: rgba(0, 212, 255, 0.55);
 }
 
 /* === Кнопки === */

@@ -6,21 +6,33 @@
       <stop offset="100%" stop-color="#020408"/>
     </radialGradient>
     <radialGradient id="core" cx="50%" cy="50%" r="55%">
-      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.95"/>
-      <stop offset="40%" stop-color="#5be8ff" stop-opacity="0.85"/>
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.97"/>
+      <stop offset="30%" stop-color="#e0f8ff" stop-opacity="0.90"/>
+      <stop offset="60%" stop-color="#5be8ff" stop-opacity="0.70"/>
       <stop offset="100%" stop-color="#00d4ff" stop-opacity="0.0"/>
     </radialGradient>
     <radialGradient id="glow" cx="50%" cy="50%" r="65%">
-      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.55"/>
+      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.60"/>
+      <stop offset="50%" stop-color="#00d4ff" stop-opacity="0.25"/>
       <stop offset="100%" stop-color="#00d4ff" stop-opacity="0.0"/>
     </radialGradient>
+    <radialGradient id="outerGlow" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#00d4ff" stop-opacity="0.0"/>
+    </radialGradient>
+    <filter id="softBlur" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3"/>
+    </filter>
   </defs>
 
   <!-- background disc -->
   <circle cx="128" cy="128" r="120" fill="url(#bg)"/>
 
+  <!-- subtle ambient glow behind everything -->
+  <circle cx="128" cy="128" r="110" fill="url(#outerGlow)"/>
+
   <!-- outer thin ring -->
-  <circle cx="128" cy="128" r="116" fill="none" stroke="#00d4ff" stroke-opacity="0.45" stroke-width="1.5"/>
+  <circle cx="128" cy="128" r="116" fill="none" stroke="#00d4ff" stroke-opacity="0.50" stroke-width="1.5"/>
 
   <!-- outer tick marks -->
   <g stroke="#00d4ff" stroke-opacity="0.7" stroke-linecap="round">
@@ -35,8 +47,8 @@
       <line x1="48"  y1="208" x2="60"  y2="196"/>
       <line x1="196" y1="60"  x2="208" y2="48"/>
     </g>
-    <!-- minor ticks at 15° steps -->
-    <g stroke-width="1" stroke-opacity="0.35">
+    <!-- minor ticks at 15 steps -->
+    <g stroke-width="1.2" stroke-opacity="0.40">
       <line x1="167" y1="22"  x2="171" y2="38"/>
       <line x1="89"  y1="22"  x2="85"  y2="38"/>
       <line x1="234" y1="89"  x2="218" y2="85"/>
@@ -49,16 +61,26 @@
   </g>
 
   <!-- concentric rings -->
-  <circle cx="128" cy="128" r="98" fill="none" stroke="#00d4ff" stroke-opacity="0.55" stroke-width="1.8"/>
-  <circle cx="128" cy="128" r="78" fill="none" stroke="#00d4ff" stroke-opacity="0.40" stroke-width="1.6"/>
+  <circle cx="128" cy="128" r="98" fill="none" stroke="#00d4ff" stroke-opacity="0.55" stroke-width="2.0"/>
+  <circle cx="128" cy="128" r="78" fill="none" stroke="#00d4ff" stroke-opacity="0.40" stroke-width="1.8"/>
   <circle cx="128" cy="128" r="60" fill="none" stroke="#00d4ff" stroke-opacity="0.50" stroke-width="1.5" stroke-dasharray="2 4"/>
+
+  <!-- soft blurred ring glow (subtle) -->
+  <circle cx="128" cy="128" r="98" fill="none" stroke="#00d4ff" stroke-opacity="0.18" stroke-width="8" filter="url(#softBlur)"/>
+  <circle cx="128" cy="128" r="78" fill="none" stroke="#00d4ff" stroke-opacity="0.12" stroke-width="6" filter="url(#softBlur)"/>
 
   <!-- big halo -->
   <circle cx="128" cy="128" r="80" fill="url(#glow)"/>
 
   <!-- glowing core -->
-  <circle cx="128" cy="128" r="42" fill="url(#core)"/>
+  <circle cx="128" cy="128" r="44" fill="url(#core)"/>
+
+  <!-- inner core ring -->
+  <circle cx="128" cy="128" r="32" fill="none" stroke="#00d4ff" stroke-opacity="0.30" stroke-width="0.8"/>
 
   <!-- white hot center -->
-  <circle cx="128" cy="128" r="14" fill="#ffffff" opacity="0.95"/>
+  <circle cx="128" cy="128" r="15" fill="#ffffff" opacity="0.96"/>
+
+  <!-- tiny sparkle in center -->
+  <circle cx="128" cy="128" r="6" fill="#ffffff" opacity="0.40" filter="url(#softBlur)"/>
 </svg>
