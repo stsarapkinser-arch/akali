@@ -1,29 +1,31 @@
-"""Главное окно ассистента — координатор страниц.
+"""Главное окно ассистента — минималистичный экран с реактором.
 
 Архитектура:
-    • Frameless window (без системного декора, drag в ModernHeaderBar)
-    • QStackedWidget с тремя страницами: Главная, Команды, Настройки
-    • Тёмная футуристичная тема (Cyber Arc)
-    • System Tray (minimize/restore)
+    • Нативный системный декор окна (KDE/GNOME/whatever DE рисует tit
+      lebar) — drag/minimize/maximize/close через WM, без кастомных
+      кнопок в шапке.
+    • Только одна страница — HomePage. Никаких вкладок «Команды» и
+      «Настройки» (управление вынесено в QSettings, обновление через
+      трей).
+    • Никакого status-row внизу.
+    • Стиль `Cyber Arc` остаётся для самой страницы.
 
-Все логи идут через `logging` в stdout, поэтому вкладки «Лог» больше нет.
+Все логи идут через `logging` в stdout — UI-вкладки «Лог» нет.
 """
 from __future__ import annotations
 
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QSettings, Qt, Signal, Slot
+from PySide6.QtCore import QSettings, Signal, Slot
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QApplication, QFrame, QMainWindow, QMessageBox,
-                                QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QMessageBox,
+                                QVBoxLayout, QWidget)
 
-from .. import __version__ as AKALI_VERSION
 from ..core.backend import AssistantCore
 from ..core.updater import UpdateResult
 from .icons import IconSet
-from .pages import CommandsPage, HomePage, SettingsPage
-from .widgets import ModernHeaderBar, StatusRow
+from .pages import HomePage
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +36,11 @@ WINDOW_MIN_HEIGHT = 600
 
 
 class MainWindow(QMainWindow):
-    """Главное окно: header + страницы + status row."""
+    """Главное окно: только HomePage. Без вкладок, без status row."""
 
-    # Команды от UI к координатору
+    # Команды от UI к координатору (большинство сигналов сохранены ради
+    # совместимости с app.py, чтобы не править кучу connect'ов; часть
+    # просто не эмитится — ничего страшного).
     start_requested = Signal()
     stop_requested = Signal()
     reindex_requested = Signal()
@@ -45,8 +49,8 @@ class MainWindow(QMainWindow):
     check_update_requested = Signal()
     show_requested = Signal()
     quit_requested = Signal()
-    run_command_requested = Signal(str)        # запуск команды кликом из CommandsPage
-    edit_commands_requested = Signal()         # запрос пересборки базы после редактирования
+    run_command_requested = Signal(str)
+    edit_commands_requested = Signal()
 
     def __init__(self, core: AssistantCore, settings: QSettings, repo_dir: str,
                  icon: Optional[QIcon] = None, parent: QWidget | None = None):
@@ -56,9 +60,9 @@ class MainWindow(QMainWindow):
         self._repo_dir = repo_dir
         self._icon = icon or IconSet.reactor()
 
-        self.setWindowTitle("Akali — голосовой ассистент")
+        self.setWindowTitle("Akali")
         self.setWindowIcon(self._icon)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # Нативный декор окна — без FramelessWindowHint, без StaysOnTop.
         self.setGeometry(100, 100, WINDOW_WIDTH, WINDOW_HEIGHT)
         self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
 
@@ -66,7 +70,6 @@ class MainWindow(QMainWindow):
 
         self._load_stylesheet()
         self._build()
-        self._wire()
 
     def _load_stylesheet(self) -> None:
         from .. import paths
@@ -84,37 +87,8 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self.header = ModernHeaderBar(AKALI_VERSION, parent=self)
-        self.header.setObjectName("headerBar")
-        outer.addWidget(self.header)
-
-        sep_top = QFrame()
-        sep_top.setObjectName("topSeparator")
-        sep_top.setFrameShape(QFrame.HLine)
-        sep_top.setMaximumHeight(1)
-        outer.addWidget(sep_top)
-
-        self.stack = QStackedWidget()
-        self.stack.setObjectName("pageStack")
         self.home_page = HomePage()
-        self.commands_page = CommandsPage(self._core)
-        self.settings_page = SettingsPage(self._core, self._settings, self._repo_dir)
-
-        self._page_index = {
-            "home":     self.stack.addWidget(self.home_page),
-            "commands": self.stack.addWidget(self.commands_page),
-            "settings": self.stack.addWidget(self.settings_page),
-        }
-        outer.addWidget(self.stack, 1)
-
-        sep_bot = QFrame()
-        sep_bot.setObjectName("bottomSeparator")
-        sep_bot.setFrameShape(QFrame.HLine)
-        sep_bot.setMaximumHeight(1)
-        outer.addWidget(sep_bot)
-
-        self.status_row = StatusRow()
-        outer.addWidget(self.status_row)
+        outer.addWidget(self.home_page, 1)
 
         self.setCentralWidget(central)
 
@@ -128,74 +102,47 @@ class MainWindow(QMainWindow):
         else:
             event.accept()
 
-    # ── Связи ─────────────────────────────────────────────────
-    def _wire(self) -> None:
-        self.header.tab_clicked.connect(self._switch_page)
-        self.home_page.start_clicked.connect(self.start_requested.emit)
-        self.home_page.stop_clicked.connect(self.stop_requested.emit)
-        self.home_page.reindex_clicked.connect(self.reindex_requested.emit)
-        self.commands_page.reindex_requested.connect(self.reindex_requested.emit)
-        self.commands_page.run_command.connect(self.run_command_requested.emit)
-        self.commands_page.commands_changed.connect(self._on_commands_changed)
-        self.settings_page.reload_requested.connect(self.reload_core_requested.emit)
-        self.settings_page.update_requested.connect(self.update_requested.emit)
-        self.settings_page.check_update_requested.connect(self.check_update_requested.emit)
-
-    @Slot(str)
-    def _switch_page(self, key: str) -> None:
-        idx = self._page_index.get(key)
-        if idx is not None:
-            self.stack.setCurrentIndex(idx)
-            self.header.set_active(key)
-
-    @Slot()
-    def _on_commands_changed(self) -> None:
-        """Юзер отредактировал commands.txt через UI — просим coordinator перезагрузить."""
-        self.reload_core_requested.emit()
-
     # ── Слоты со стороны AudioWorker'а ────────────────────────
     @Slot(str)
     def on_status(self, status: str) -> None:
         self.home_page.set_state(status)
-        active = status in ("listening", "waiting_command", "processing",
-                            "starting", "recovering")
-        self.status_row.set_mic_active(active)
-        self.status_row.set_brain_active(status == "processing")
 
     @Slot(str)
-    def on_text(self, text: str) -> None:
-        self.home_page.show_spoken(text, is_partial=False)
+    def on_text(self, _text: str) -> None:
+        # Распознанный текст больше не выводится в UI — только в логах
+        # (audio_worker уже логирует).
+        pass
 
     @Slot(str)
-    def on_partial_text(self, text: str) -> None:
-        self.home_page.show_spoken(text, is_partial=True)
+    def on_partial_text(self, _text: str) -> None:
+        pass
 
     @Slot()
     def on_wake(self) -> None:
-        pass  # лог рисуется в audio_worker через logging
+        pass  # лог рисуется в audio_worker
 
     @Slot(str, str, float, str)
-    def on_command_matched(self, spoken: str, cmd: str, conf: float, method: str) -> None:
+    def on_command_matched(self, _spoken: str, _cmd: str, conf: float,
+                            method: str) -> None:
         self.home_page.show_confidence(conf, method)
 
     @Slot(str, object)
     def on_command_executed(self, cmd: str, result) -> None:
-        # Логи рисует audio_worker и core.execute; UI просто показывает toast.
         rc = getattr(result, "returncode", 0)
         if getattr(result, "is_background", False):
             self.home_page.show_toast(f"▶ {cmd[:40]}")
         elif getattr(result, "error", "") or rc != 0:
-            self.home_page.show_toast(f"⚠ {(getattr(result, 'error', '') or 'rc=' + str(rc))[:60]}")
+            err = getattr(result, "error", "") or f"rc={rc}"
+            self.home_page.show_toast(f"⚠ {err[:60]}")
         else:
             self.home_page.show_toast("ок")
 
     @Slot(str, float)
-    def on_no_match(self, spoken: str, max_conf: float) -> None:
+    def on_no_match(self, spoken: str, _max_conf: float) -> None:
         self.home_page.show_toast(f"не понял: {spoken[:30]}")
 
     @Slot(str)
     def on_error(self, msg: str) -> None:
-        # Восстановимые ошибки уже залогированы в audio_worker; не мусорим UI.
         self.home_page.show_toast(f"⚠ {msg[:60]}")
 
     @Slot(str)
@@ -207,7 +154,6 @@ class MainWindow(QMainWindow):
     @Slot(float)
     def on_level(self, level: float) -> None:
         self.home_page.set_level(level)
-        self.status_row.set_mic_level(level)
 
     @Slot(bool, str, object)
     def on_reindex_done(self, ok: bool, err: str, stats) -> None:
@@ -216,7 +162,6 @@ class MainWindow(QMainWindow):
             self.home_page.show_toast(f"индекс пересобран: {n} команд")
         else:
             self.home_page.show_toast(f"реиндекс не удался: {err[:40]}")
-        self.commands_page.refresh()
 
     @Slot(object)
     def on_update_result(self, result: UpdateResult) -> None:
@@ -245,15 +190,16 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def reload_complete(self) -> None:
-        self.commands_page.refresh()
         self.home_page.show_toast("База перезагружена")
 
-    # ── Status row helpers ────────────────────────────────────
-    def set_mic_subtitle(self, text: str) -> None:
-        self.status_row.mic.set_subtitle(text)
+    # ── Совместимость со старым API (no-op) ───────────────────
+    # Эти методы оставлены для обратной совместимости с app.py — теперь
+    # они просто ничего не делают, т.к. нижней панели больше нет.
+    def set_mic_subtitle(self, _text: str) -> None:
+        pass
 
-    def set_brain_subtitle(self, text: str) -> None:
-        self.status_row.brain.set_subtitle(text)
+    def set_brain_subtitle(self, _text: str) -> None:
+        pass
 
-    def set_resources_subtitle(self, text: str) -> None:
-        self.status_row.resources.set_subtitle(text)
+    def set_resources_subtitle(self, _text: str) -> None:
+        pass

@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import os
 import signal
-import socket
 import subprocess
 import sys
 from typing import Optional
@@ -216,25 +215,25 @@ class AkaliApp(QObject):
         self._auto_install_thread: QThread | None = None
         self._auto_install_runner: AutoInstallRunner | None = None
 
-        # === Resource poll timer ===
-        self._resource_timer = QTimer(self)
-        self._resource_timer.setInterval(2000)
-        self._resource_timer.timeout.connect(self._update_resources)
-
         # === Auto-update timer ===
+        # Status row убран — resource poll больше не нужен.
+
         self._auto_update_timer = QTimer(self)
         self._auto_update_timer.setSingleShot(False)
         self._auto_update_timer.timeout.connect(self._on_auto_update_tick)
 
         self._wire()
         self._initial_load()
-        self._update_resources()
-        self._resource_timer.start()
         self._apply_auto_update_setting(int(self._settings.value("auto_update_minutes", 0) or 0))
 
         # === Старт автоустановки безопасных компонентов в фоне.
         # Сразу же — но через event-loop, чтобы UI успел отрисоваться.
         QTimer.singleShot(200, self._kickoff_auto_install)
+
+        # === Авто-старт прослушивания: Кнопки «Слушать» больше нет —
+        # Акали сразу начинает слушать. Через QTimer, чтобы UI и трей
+        # успели инициализироваться.
+        QTimer.singleShot(300, self.start_listening)
 
     # ------------------------------------------------------------
     def _restore_core_settings(self) -> None:
@@ -262,9 +261,6 @@ class AkaliApp(QObject):
             log.info("База команд: %d (curated=%d, auto=%d) · auto: %s",
                      stats.commands_total, stats.curated_count, stats.auto_count, srcs)
 
-        self._window.commands_page.refresh()
-        self._window.set_brain_subtitle("FastEmbed + Ollama/Gemini")
-
         gemini_key = str(self._settings.value("gemini_api_key", "") or "").strip()
         llm_mode = str(self._settings.value("llm_mode", "auto") or "auto")
         try:
@@ -280,9 +276,9 @@ class AkaliApp(QObject):
         w = self._window
         a = self._audio_worker
         t = self._tray
-        sp = w.settings_page
 
-        # UI → action
+        # UI → action (вкладок «Команды» и «Настройки» больше нет —
+        # сигналы оставлены ради совместимости с трейем и start/stop).
         w.start_requested.connect(self.start_listening)
         w.stop_requested.connect(self.stop_listening)
         w.reindex_requested.connect(a.request_reindex)
@@ -292,15 +288,6 @@ class AkaliApp(QObject):
         w.show_requested.connect(self.show_window)
         w.quit_requested.connect(self.quit)
         w.run_command_requested.connect(self._on_run_command)
-
-        # Settings page → action
-        sp.device_changed.connect(a.set_device)
-        sp.update_requested.connect(self.run_update)
-        sp.check_update_requested.connect(self.run_check)
-        sp.auto_update_changed.connect(self._apply_auto_update_setting)
-        sp.tts_settings_changed.connect(self._on_tts_settings_changed)
-        sp.gemini_test_requested.connect(self._on_gemini_test)
-        sp.system_check_requested.connect(self._on_system_check)
 
         # Tray → action
         t.start_clicked.connect(self.start_listening)
@@ -359,7 +346,6 @@ class AkaliApp(QObject):
 
     @Slot(str)
     def _on_device_info(self, info: str) -> None:
-        self._window.set_mic_subtitle(info[:40])
         log.info("Микрофон: %s", info)
 
     @Slot(str)
@@ -407,7 +393,7 @@ class AkaliApp(QObject):
         чтобы один сбой не помешал остановке остального.
         """
         # 1. Таймеры
-        for tmr_attr in ("_resource_timer", "_auto_update_timer"):
+        for tmr_attr in ("_auto_update_timer",):
             try:
                 tmr = getattr(self, tmr_attr, None)
                 if tmr is not None and tmr.isActive():
@@ -454,7 +440,7 @@ class AkaliApp(QObject):
         if (self._check_thread and self._check_thread.isRunning()) or \
            (self._update_thread and self._update_thread.isRunning()):
             return
-        repo = self._window.settings_page.repo_dir or self._repo_dir
+        repo = self._repo_dir
         log.info("Проверка обновлений в %s…", repo)
         thread = QThread()
         runner = CheckRunner(repo)
@@ -471,17 +457,17 @@ class AkaliApp(QObject):
     @Slot(object)
     def _on_check_finished(self, info: VersionInfo) -> None:
         try:
-            self._window.settings_page.on_version_info(info)
+            if info.error:
+                log.warning("Проверка обновлений: %s", info.error)
+            elif getattr(info, "has_updates", False):
+                log.info("Доступно %d новых коммитов",
+                         getattr(info, "commits_behind", 0))
+            else:
+                log.info("Версия актуальна")
         except Exception as e:  # noqa: BLE001
-            log.error("on_version_info упал: %s", e)
+            log.error("on_check_finished упал: %s", e)
         self._check_thread = None
         self._check_runner = None
-        if info.error:
-            log.warning("Проверка обновлений: %s", info.error)
-        elif info.has_updates:
-            log.info("Доступно %d новых коммитов", info.commits_behind)
-        else:
-            log.info("Версия актуальна")
 
     @Slot(bool)
     def run_update(self, force: bool = False) -> None:
@@ -491,7 +477,7 @@ class AkaliApp(QObject):
         if self._check_thread and self._check_thread.isRunning():
             log.info("Дождись проверки…")
             return
-        repo = self._window.settings_page.repo_dir or self._repo_dir
+        repo = self._repo_dir
         log.info("git pull (force=%s) в %s…", force, repo)
         thread = QThread()
         thread.setObjectName("akali-update")
@@ -519,10 +505,6 @@ class AkaliApp(QObject):
             self._window.on_update_result(result)
         except Exception as e:  # noqa: BLE001
             log.error("on_update_result (window) упал: %s", e)
-        try:
-            self._window.settings_page.on_update_result(result)
-        except Exception as e:  # noqa: BLE001
-            log.error("on_update_result (settings) упал: %s", e)
         # thread/runner будут обнулены через thread.finished → _clear_update_refs
 
         if result.ok and result.needs_restart:
@@ -640,7 +622,10 @@ class AkaliApp(QObject):
 
     @Slot(bool, str)
     def _on_gemini_test_done(self, ok: bool, message: str) -> None:
-        self._window.settings_page.show_gemini_test_result(ok, message)
+        if ok:
+            log.info("Gemini API: %s", message)
+        else:
+            log.warning("Gemini API недоступен: %s", message)
         self._gemini_test_thread = None
         self._gemini_test_runner = None
 
@@ -669,9 +654,8 @@ class AkaliApp(QObject):
                 mark = "✓" if cr.ok else ("⚠" if cr.fixable else "✕")
                 lines.append(f"{mark} {cr.name}: {cr.message}")
             system_check.print_report(report)
-            self._window.settings_page.show_check_result(lines)
         except Exception as e:  # noqa: BLE001
-            log.error("show_check_result упал: %s", e)
+            log.error("print_report упал: %s", e)
         self._sys_check_thread = None
         self._sys_check_runner = None
 
@@ -799,22 +783,6 @@ class AkaliApp(QObject):
     def _on_no_match_voice(self, spoken: str, max_conf: float) -> None:
         if self._tts.enabled:
             self._tts.say("Не понял команду")
-
-    # ── Status row подписи ──────────────────────────────────
-    def _update_resources(self) -> None:
-        try:
-            with open(f"/proc/{os.getpid()}/status", "r", encoding="utf-8") as f:
-                rss_kb = 0
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        rss_kb = int(line.split()[1])
-                        break
-            mb = rss_kb / 1024.0
-            self._window.set_resources_subtitle(f"RAM {mb:.0f} MB")
-        except OSError:
-            self._window.set_resources_subtitle(socket.gethostname())
-        if not self._is_listening:
-            self._window.set_mic_subtitle("Не слушает")
 
 
 # ============================================================

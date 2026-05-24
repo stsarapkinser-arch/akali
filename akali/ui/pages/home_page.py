@@ -1,33 +1,26 @@
-"""Главный экран: реактор + статус + кнопки управления.
+"""Главный (и единственный) экран ассистента: реактор + статус + тост.
 
-Раскладка (окно ~420):
-
+Раскладка:
     ┌──── 420 wide ─────────────────┐
-    │                               │
     │      ┌─── reactor ───┐        │
     │      │   320×320     │        │
     │      └───────────────┘        │
     │         СЛУШАЮ                │  bigStatus
     │   Скажите «Акали» и команду   │  hint
-    │  [====confidence bar====]     │  (2.5s timeout)
-    │                               │
-    │   ┌───── СЛУШАТЬ ──────┐      │  primaryBtn
-    │   ┌─ Переиндексировать ┐      │  secondaryBtn
-    │                               │
-    │───────────────────────────────│
-    │  «последнее» [⎘]              │  spokenText + copy
-    │  ╔══════════════════════╗     │  llmPanel (hidden)
-    │  ║ AI ОТВЕТ: ...        ║     │
-    │  ╚══════════════════════╝     │
+    │  [====confidence bar====]     │  (2.5s timeout, скрывается)
     └───────────────────────────────┘
-    [  toast overlay (временный)  ]
+    [   toast overlay (временный)  ]
+
+Никаких кнопок «Слушать» / «Переиндексировать», никакого отображения
+распознанной речи, никакого AI-ответа. Акали слушает по умолчанию,
+команды просто выполняются.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
-                                QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout,
+                                QWidget)
 
 from ..widgets import Reactor
 
@@ -50,8 +43,8 @@ STATE_HINT = {
     "processing":       "Команда найдена, запускаю",
     "reindexing":       "Сканирую .desktop и KWin",
     "recovering":       "Перезапуск PipeWire / PulseAudio",
-    "stopped":          "Нажмите «Слушать», чтобы активировать",
-    "error":            "См. вкладку «Лог»",
+    "stopped":          "Ожидание запуска прослушивания",
+    "error":            "Смотри лог в терминале",
 }
 
 # Цвета планки уверенности по методу
@@ -101,25 +94,30 @@ class _ConfidenceBar(QWidget):
 
 
 class HomePage(QWidget):
-    """Экран ассистента: реактор + большой статус + кнопки."""
+    """Экран ассистента: реактор + большой статус + toast.
 
-    start_clicked   = Signal()
-    stop_clicked    = Signal()
-    reindex_clicked = Signal()
+    Без кнопок управления (start/stop/reindex) — Акали слушает по
+    умолчанию. Сигналы оставлены ради совместимости с MainWindow, но
+    больше не эмитятся.
+    """
+
+    start_clicked   = Signal()  # совместимость
+    stop_clicked    = Signal()  # совместимость
+    reindex_clicked = Signal()  # совместимость
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("homePage")
-        self._listening = False
-        self._last_spoken = ""
         self._build()
         self.set_state("stopped")
 
     # ── Сборка ──────────────────────────────────────────────────────
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 6, 16, 10)
-        outer.setSpacing(5)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(8)
+
+        outer.addStretch(1)
 
         # ── Реактор ──
         center = QHBoxLayout()
@@ -161,71 +159,7 @@ class HomePage(QWidget):
         conf_row.addStretch(1)
         outer.addLayout(conf_row)
 
-        outer.addSpacing(4)
-
-        # ── Кнопки ──
-        self._btn_listen = QPushButton("Слушать")
-        self._btn_listen.setObjectName("primaryBtn")
-        self._btn_listen.setCursor(Qt.PointingHandCursor)
-        self._btn_listen.setMinimumHeight(40)
-        self._btn_listen.clicked.connect(self._on_listen_clicked)
-        outer.addWidget(self._btn_listen)
-
-        self._btn_reindex = QPushButton("Переиндексировать")
-        self._btn_reindex.setObjectName("secondaryBtn")
-        self._btn_reindex.setCursor(Qt.PointingHandCursor)
-        self._btn_reindex.setMinimumHeight(32)
-        self._btn_reindex.clicked.connect(self.reindex_clicked.emit)
-        outer.addWidget(self._btn_reindex)
-
-        outer.addStretch(1)
-
-        # ── Разделитель ──
-        sep = QFrame()
-        sep.setObjectName("homeSeparator")
-        sep.setFrameShape(QFrame.HLine)
-        outer.addWidget(sep)
-
-        # ── Spoken text + кнопка копирования ──
-        spoken_row = QHBoxLayout()
-        spoken_row.setContentsMargins(0, 2, 0, 0)
-        spoken_row.setSpacing(4)
-
-        self._spoken = QLabel("")
-        self._spoken.setObjectName("spokenText")
-        self._spoken.setWordWrap(False)
-        self._spoken.setMinimumHeight(24)
-        self._spoken.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        spoken_row.addWidget(self._spoken, 1)
-
-        self._btn_copy = QPushButton("⎘")
-        self._btn_copy.setObjectName("copyBtn")
-        self._btn_copy.setFixedSize(22, 22)
-        self._btn_copy.setCursor(Qt.PointingHandCursor)
-        self._btn_copy.setToolTip("Копировать")
-        self._btn_copy.clicked.connect(self._copy_spoken)
-        spoken_row.addWidget(self._btn_copy)
-        outer.addLayout(spoken_row)
-
-        # ── LLM-панель ──
-        self._llm_panel = QFrame(self)
-        self._llm_panel.setObjectName("llmPanel")
-        self._llm_panel.setFrameShape(QFrame.NoFrame)
-        llm_v = QVBoxLayout(self._llm_panel)
-        llm_v.setContentsMargins(10, 8, 10, 8)
-        llm_v.setSpacing(4)
-
-        llm_title = QLabel("AI ОТВЕТ")
-        llm_title.setObjectName("llmTitle")
-        llm_v.addWidget(llm_title)
-
-        self._llm_text = QLabel("")
-        self._llm_text.setObjectName("llmText")
-        self._llm_text.setWordWrap(True)
-        llm_v.addWidget(self._llm_text)
-
-        self._llm_panel.hide()
-        outer.addWidget(self._llm_panel)
+        outer.addStretch(2)
 
         # ── Toast (overlay, не в layout) ──
         self._toast = QLabel("", self)
@@ -243,25 +177,12 @@ class HomePage(QWidget):
         self._reactor.set_state(state)
         self._state_text.setText(STATE_TEXT.get(state, state))
         self._hint.setText(STATE_HINT.get(state, ""))
-        self._listening = state in (
-            "listening", "waiting_command", "processing",
-            "recovering", "starting", "reindexing",
-        )
-        self._update_buttons()
 
     @Slot(str)
-    def show_spoken(self, text: str, is_partial: bool = False) -> None:
-        if len(text) > 64:
-            text = text[:61] + "…"
-        if is_partial:
-            self._spoken.setProperty("partial", "true")
-            self._spoken.setText(f"«{text}▌»")
-        else:
-            self._last_spoken = text
-            self._spoken.setProperty("partial", "false")
-            self._spoken.setText(f"«{text}»")
-        self._spoken.style().unpolish(self._spoken)
-        self._spoken.style().polish(self._spoken)
+    def show_spoken(self, _text: str, is_partial: bool = False) -> None:
+        # Распознанная речь больше не отображается на главном экране —
+        # только в логах. Метод-стуб для обратной совместимости.
+        pass
 
     @Slot(float, str)
     def show_confidence(self, conf: float, method: str) -> None:
@@ -271,13 +192,9 @@ class HomePage(QWidget):
         QTimer.singleShot(2500, self, self._hide_confidence)
 
     @Slot(str)
-    def show_llm_response(self, text: str) -> None:
-        if not text.strip():
-            return
-        if len(text) > 300:
-            text = text[:297] + "…"
-        self._llm_text.setText(text)
-        self._llm_panel.show()
+    def show_llm_response(self, _text: str) -> None:
+        # LLM-ответ больше не выводим в UI — только в логах.
+        pass
 
     @Slot(str)
     def show_toast(self, text: str) -> None:
@@ -297,27 +214,6 @@ class HomePage(QWidget):
         pass
 
     # ── Приватные ────────────────────────────────────────────────────
-    def _on_listen_clicked(self) -> None:
-        if self._listening:
-            self.stop_clicked.emit()
-        else:
-            self.start_clicked.emit()
-
-    def _update_buttons(self) -> None:
-        if self._listening:
-            self._btn_listen.setText("Остановить")
-            self._btn_listen.setProperty("danger", True)
-        else:
-            self._btn_listen.setText("Слушать")
-            self._btn_listen.setProperty("danger", False)
-        self._btn_listen.style().unpolish(self._btn_listen)
-        self._btn_listen.style().polish(self._btn_listen)
-
-    def _copy_spoken(self) -> None:
-        text = self._last_spoken or self._spoken.text().strip("«»")
-        if text:
-            QGuiApplication.clipboard().setText(text)
-
     def _hide_confidence(self) -> None:
         self._conf_bar.hide()
         self._conf_lbl.hide()
@@ -326,10 +222,10 @@ class HomePage(QWidget):
         self._toast.hide()
 
     # ── Toast позиционирование ───────────────────────────────────────
-    def resizeEvent(self, event) -> None:
+    def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         # Toast в нижней части страницы, центрирован
         tw, th = 300, 36
         tx = (self.width() - tw) // 2
-        ty = self.height() - th - 10
+        ty = self.height() - th - 14
         self._toast.setGeometry(tx, ty, tw, th)

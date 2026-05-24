@@ -24,6 +24,9 @@ voices/jarvis_reference.*
 # зависит от движка и системы.
 *.wav.part
 
+# Временный install-скрипт Ollama (скачивается system_check автоматически).
+.ollama-install.sh
+
 # Local secrets
 .env
 .env.*
