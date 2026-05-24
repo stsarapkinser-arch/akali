@@ -248,6 +248,7 @@ class SettingsPage(QWidget):
     auto_update_changed = Signal(int)      # минуты (0 = выкл.)
     tts_settings_changed = Signal(bool, str, str)   # enabled, engine, piper_voice
     gemini_test_requested = Signal(str)    # API key для теста
+    llm_mode_changed = Signal(str)          # auto | gemini-only | ollama-only
     system_check_requested = Signal()
 
     def __init__(self, core: AssistantCore, settings: QSettings,
@@ -309,6 +310,17 @@ class SettingsPage(QWidget):
         gemini_btn.setMinimumHeight(28)
         gemini_btn.clicked.connect(self._on_gemini_test_clicked)
         llm_card.add(gemini_btn)
+
+        # Селектор режима маршрутизации LLM
+        self._cmb_llm_mode = QComboBox()
+        self._cmb_llm_mode.addItem(
+            "auto — сначала Gemini, при ошибке фоллбэк на локальную модель", "auto")
+        self._cmb_llm_mode.addItem(
+            "gemini-only — только облачная (без локального фоллбэка)", "gemini-only")
+        self._cmb_llm_mode.addItem(
+            "ollama-only — только локальная (полностью оффлайн)", "ollama-only")
+        self._cmb_llm_mode.setMinimumHeight(28)
+        llm_card.add(_form_row("Режим", self._cmb_llm_mode))
         col.addWidget(llm_card)
 
         # ── TTS ─────────────────────────────────────────
@@ -317,7 +329,8 @@ class SettingsPage(QWidget):
         self._chk_tts_enabled = QCheckBox("Включить голосовой ответ")
         tts_card.add(self._chk_tts_enabled)
         self._cmb_tts_voice = QComboBox()
-        self._cmb_tts_voice.addItem("auto (piper если есть, иначе espeak)", "auto")
+        self._cmb_tts_voice.addItem("auto (xtts если готов, иначе piper, иначе espeak)", "auto")
+        self._cmb_tts_voice.addItem("xtts (клонированный голос Джарвиса)", "xtts")
         self._cmb_tts_voice.addItem("piper (нейронный, мужской/женский ru)", "piper")
         self._cmb_tts_voice.addItem("espeak-ng (резерв)", "espeak")
         self._cmb_tts_voice.addItem("выключить", "off")
@@ -439,6 +452,11 @@ class SettingsPage(QWidget):
         self._edit_wake.setText(", ".join(self._core.wake_words))
         self._edit_reindex.setText(", ".join(self._core.reindex_triggers))
         self._edit_gemini_key.setText(str(s.value("gemini_api_key", "") or ""))
+        # LLM mode
+        llm_mode = str(s.value("llm_mode", "auto") or "auto")
+        idx = self._cmb_llm_mode.findData(llm_mode)
+        if idx >= 0:
+            self._cmb_llm_mode.setCurrentIndex(idx)
         # TTS
         tts_on = str(s.value("tts_enabled", "true")).lower() in ("1", "true", "yes")
         self._chk_tts_enabled.setChecked(tts_on)
@@ -471,6 +489,8 @@ class SettingsPage(QWidget):
         s.setValue("reindex_triggers", ",".join(self._core.reindex_triggers))
         api_key = self._edit_gemini_key.text().strip()
         s.setValue("gemini_api_key", api_key)
+        llm_mode = self._cmb_llm_mode.currentData() or "auto"
+        s.setValue("llm_mode", llm_mode)
         s.setValue("repo_dir", self._edit_repo.text().strip() or self._repo_dir)
         self._repo_dir = self._edit_repo.text().strip() or self._repo_dir
 
@@ -491,6 +511,8 @@ class SettingsPage(QWidget):
 
         # Обновляем ключ Gemini в роутере без полной перезагрузки
         self._core.update_gemini_key(api_key or None)
+        self._core.update_llm_mode(llm_mode)
+        self.llm_mode_changed.emit(llm_mode)
 
         self.reload_requested.emit()
 

@@ -13,6 +13,17 @@ __pycache__/
 # Vosk speech-recognition model (88+ MB) — downloaded by setup.sh
 model/
 
+# Voices: piper .onnx + XTTS jarvis reference wav (загружается пользователем,
+# не лежит в git — это «private» голос для voice cloning).
+voices/*.onnx
+voices/*.onnx.json
+voices/jarvis_reference.wav
+voices/jarvis_reference.*
+
+# TTS audio cache (~/.cache/akali/tts) — генерируется при первом запуске,
+# зависит от движка и системы.
+*.wav.part
+
 # Local secrets
 .env
 .env.*

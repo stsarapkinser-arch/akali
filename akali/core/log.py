@@ -33,6 +33,16 @@ _ANSI = {
 }
 _RESET = "\033[0m"
 
+# Базовые ANSI-формы (для helper-функций log.section/success/warn_box)
+BOLD = "\033[1m"
+DIM = "\033[2m"
+BR_CYAN = "\033[1;96m"      # bold bright cyan — section headers
+BR_GREEN = "\033[1;92m"     # bold bright green — success
+BR_YELLOW = "\033[1;93m"    # bold bright yellow — warnings
+BR_RED = "\033[1;91m"       # bold bright red — errors
+BR_MAGENTA = "\033[1;95m"   # bold bright magenta — debug-blocks
+BG_RED = "\033[1;97;41m"    # white on red — critical errors
+
 _LEVEL_LABEL: Mapping[str, str] = {
     "DEBUG":    "·",
     "INFO":     "i",
@@ -40,6 +50,8 @@ _LEVEL_LABEL: Mapping[str, str] = {
     "ERROR":    "x",
     "CRITICAL": "X",
 }
+
+_use_color = False
 
 
 class _HumanFormatter(logging.Formatter):
@@ -129,9 +141,10 @@ def setup(level: int | None = None) -> None:
     if level is None:
         level = logging.DEBUG if os.environ.get("AKALI_DEBUG") else logging.INFO
 
-    use_color = sys.stdout.isatty()
+    global _use_color
+    _use_color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
     handler = logging.StreamHandler(stream=sys.stdout)
-    handler.setFormatter(_HumanFormatter(use_color=use_color))
+    handler.setFormatter(_HumanFormatter(use_color=_use_color))
 
     root = logging.getLogger()
     root.handlers.clear()
@@ -151,9 +164,124 @@ def setup(level: int | None = None) -> None:
 
 def banner(version: str) -> None:
     """Печатает приветственный баннер."""
-    bar = "─" * 56
+    bar = "━" * 56
     log = logging.getLogger("akali")
-    log.info(bar)
-    log.info("  Akali v%s — голосовой ассистент", version)
-    log.info("  Kali Linux · KDE Plasma 6 · Wayland · Intel N100")
-    log.info(bar)
+    if _use_color:
+        log.info(f"{BR_CYAN}{bar}{_RESET}")
+        log.info(f"{BR_CYAN}  Akali v{version} — голосовой ассистент{_RESET}")
+        log.info(f"{DIM}  Kali Linux · KDE Plasma 6 · Wayland · Intel N100{_RESET}")
+        log.info(f"{BR_CYAN}{bar}{_RESET}")
+    else:
+        log.info(bar)
+        log.info("  Akali v%s — голосовой ассистент", version)
+        log.info("  Kali Linux · KDE Plasma 6 · Wayland · Intel N100")
+        log.info(bar)
+
+
+# ── Helper-функции для красивого вывода ─────────────────────────
+# Все они идут в обычный logger.info, но с ANSI-разметкой если включено
+# раскрашивание. В файле/без TTY они печатают plain text.
+
+def section(logger: logging.Logger, title: str, char: str = "─") -> None:
+    """Печатает блок-заголовок:  ▶ Маршрутизация ──────────────────
+    Используется для визуального разделения этапов pipeline.
+    """
+    fill = char * max(4, 56 - len(title) - 4)
+    if _use_color:
+        logger.info(f"{BR_CYAN}▶ {title} {fill}{_RESET}")
+    else:
+        logger.info("▶ %s %s", title, fill)
+
+
+def success(logger: logging.Logger, msg: str, *args) -> None:
+    """Зелёная success-строка с галочкой."""
+    formatted = msg % args if args else msg
+    if _use_color:
+        logger.info(f"{BR_GREEN}✓ {formatted}{_RESET}")
+    else:
+        logger.info("✓ %s", formatted)
+
+
+def warn_box(logger: logging.Logger, title: str, body: str = "") -> None:
+    """Жёлтый блок с предупреждением, дополнительные строки в body
+    выводятся отступом снизу. Каждая строка body — отдельный log-call.
+    """
+    if _use_color:
+        logger.warning(f"{BR_YELLOW}⚠ {title}{_RESET}")
+    else:
+        logger.warning("⚠ %s", title)
+    if body:
+        for line in body.splitlines():
+            if line.strip():
+                if _use_color:
+                    logger.warning(f"  {DIM}└ {line}{_RESET}")
+                else:
+                    logger.warning("  └ %s", line)
+
+
+def error_box(logger: logging.Logger, title: str, reason: str = "",
+              suggestion: str = "") -> None:
+    """Красный блок ошибки с человеческим reason и подсказкой что делать.
+    Сырой stack trace тут НЕ показываем — он попадает только в DEBUG и
+    в ~/.cache/akali/last_error.log.
+    """
+    if _use_color:
+        logger.error(f"{BR_RED}✗ {title}{_RESET}")
+        if reason:
+            logger.error(f"  {DIM}└ причина: {reason}{_RESET}")
+        if suggestion:
+            logger.error(f"  {DIM}└ совет: {suggestion}{_RESET}")
+    else:
+        logger.error("✗ %s", title)
+        if reason:
+            logger.error("  └ причина: %s", reason)
+        if suggestion:
+            logger.error("  └ совет: %s", suggestion)
+
+
+def step(logger: logging.Logger, msg: str, *args) -> None:
+    """Тусклая debug-подобная строка с префиксом « · ».
+    Используется внутри блока (section) для перечисления шагов:
+        ▶ Маршрутизация ──────
+           · cache miss
+           · semantic miss (score=0.43)
+           · gemini: error 400
+           · fallback → ollama
+    Печатается через info, чтобы было видно по умолчанию.
+    """
+    formatted = msg % args if args else msg
+    if _use_color:
+        logger.info(f"  {DIM}· {formatted}{_RESET}")
+    else:
+        logger.info("  · %s", formatted)
+
+
+def format_error(exc: BaseException) -> tuple[str, str]:
+    """Конвертирует исключение в (reason, suggestion).
+    Reason — короткое человеческое описание.
+    Suggestion — что попробовать сделать.
+    Полный стектрейс пишется только в ~/.cache/akali/last_error.log.
+    """
+    name = type(exc).__name__
+    msg = str(exc) or "<без сообщения>"
+    short = msg if len(msg) < 200 else msg[:200] + "…"
+    # Эвристики под частые случаи. low_full включает и имя класса, и
+    # текст — чтобы TimeoutError ловился даже с пустым/несвязным сообщением.
+    low = msg.lower()
+    low_full = (name + " " + msg).lower()
+    if "timeout" in low_full or "timed out" in low_full:
+        return (f"таймаут: {short}", "проверь сеть или подними таймаут")
+    if "connection" in low and ("refused" in low or "reset" in low):
+        return (f"{name}: {short}", "сервер недоступен — проверь что он запущен")
+    if "name or service not known" in low or "nodename nor servname" in low:
+        return (f"{name}: {short}", "нет интернета или DNS не отвечает")
+    if "failed_precondition" in low and "location" in low:
+        return (f"{name}: API закрыто для региона",
+                "включи VPN или используй локальную модель")
+    if "unauthorized" in low or "401" in low or "403" in low:
+        return (f"{name}: {short}", "проверь API-ключ / пермишены")
+    if "rate limit" in low or "429" in low:
+        return (f"{name}: лимит запросов", "подожди или используй локальную модель")
+    if "404" in low or "not found" in low:
+        return (f"{name}: ресурс не найден", "проверь URL/имя модели")
+    return (f"{name}: {short}", "")

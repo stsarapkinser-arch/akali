@@ -266,8 +266,12 @@ class AkaliApp(QObject):
         self._window.set_brain_subtitle("FastEmbed + Ollama/Gemini")
 
         gemini_key = str(self._settings.value("gemini_api_key", "") or "").strip()
+        llm_mode = str(self._settings.value("llm_mode", "auto") or "auto")
         try:
-            self._core.init_router(gemini_api_key=gemini_key or None)
+            self._core.init_router(
+                gemini_api_key=gemini_key or None,
+                llm_mode=llm_mode,
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("QueryRouter инициализация: %s", e)
 

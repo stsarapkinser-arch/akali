@@ -27,6 +27,12 @@ INDEXER_SCRIPT: Path = PROJECT_ROOT / "system_indexer.py"
 # ── Vosk-модель ──────────────────────────────────────────────────────
 DEFAULT_VOSK_MODEL_DIR: Path = PROJECT_ROOT / "model"
 
+# ── Voices (Piper .onnx, XTTS reference wav) ─────────────────────────
+VOICES_DIR: Path = PROJECT_ROOT / "voices"
+# Reference WAV для XTTS v2 voice cloning (загружается пользователем,
+# не коммитится в git — см. .gitignore).
+XTTS_REFERENCE_WAV: Path = VOICES_DIR / "jarvis_reference.wav"
+
 # ── UI-ресурсы (живут внутри пакета) ─────────────────────────────────
 UI_RESOURCES_DIR: Path = PACKAGE_DIR / "ui" / "resources"
 APP_STYLESHEET: Path = UI_RESOURCES_DIR / "app.qss"

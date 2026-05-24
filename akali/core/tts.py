@@ -1,9 +1,13 @@
 """Озвучка ответов ассистента приятным человеческим голосом.
 
 Приоритет движков:
-    1. `piper` (нейронный, оффлайн, мужской голос ru_RU-dmitri-medium «Джарвис») — основной.
-    2. `espeak-ng -v ru+m3` — фоллбэк для машин без piper.
-    3. Тихий no-op, если ни того ни другого нет.
+    1. `xtts` (Coqui XTTS v2 — клонированный голос Джарвиса из reference WAV).
+       Включается ТОЛЬКО если установлен пакет `TTS` И существует
+       voices/jarvis_reference.wav. Высокое качество, но требует ~2 ГБ модели
+       и заметно медленнее piper. Идеален для прекэша.
+    2. `piper` (нейронный, оффлайн, мужской голос ru_RU-dmitri-medium «Джарвис»).
+    3. `espeak-ng -v ru+m3` — фоллбэк для машин без piper.
+    4. Тихий no-op, если ничего не доступно.
 
 Архитектура:
     • Все say() — неблокирующие: фраза кладётся в очередь, воркер играет.
@@ -24,6 +28,7 @@ import os
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import Iterable, Optional
@@ -205,6 +210,143 @@ class _PiperEngine(_Engine):
             self._proc = None
 
 
+# ── XTTS v2 (Coqui) ─────────────────────────────────────────────────
+# Заглушка-инфраструктура. Реальная инициализация модели произойдёт ТОЛЬКО
+# когда пользователь предоставит voices/jarvis_reference.wav. До этого
+# момента engine.available() возвращает False и движок не выбирается.
+#
+# Принципы:
+#   • lazy-load: import TTS происходит только при первой попытке использовать
+#     движок (он тащит torch ~2 ГБ — не хотим грузить даром).
+#   • thread-safe init: одна общая модель XTTS на процесс, защищена локом.
+#   • language='ru' (XTTS v2 поддерживает мультиязычность, для жалкого ру
+#     лучше всего работает явное указание).
+#   • кэш весов модели лежит в ~/.local/share/tts/ (стандартный путь Coqui)
+
+_XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
+_XTTS_LOCK = threading.Lock()
+_XTTS_MODEL = None  # type: ignore[var-annotated]
+
+
+def _xtts_package_available() -> bool:
+    """Импортится ли пакет TTS (Coqui). НЕ загружает модель."""
+    try:
+        import importlib.util  # noqa: WPS433
+        return importlib.util.find_spec("TTS") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _xtts_reference_wav() -> Optional[Path]:
+    """Возвращает путь к jarvis_reference.wav если он существует.
+    Импорт `paths` лениво, чтобы не было циклических импортов."""
+    try:
+        from .. import paths  # noqa: WPS433
+        wav = paths.XTTS_REFERENCE_WAV
+        if wav.exists() and wav.stat().st_size > 1000:
+            return wav
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class _XTTSEngine(_Engine):
+    """XTTS v2 (Coqui) — клонированный голос из reference WAV.
+
+    Готовность движка определяется по двум условиям:
+      1. Установлен пакет `TTS` (pip install TTS).
+      2. Существует voices/jarvis_reference.wav (загружается пользователем).
+
+    Если любое условие не выполнено — engine.available() = False, и
+    выбор движков в _select_engine() пропускает XTTS.
+    """
+
+    name = "xtts"
+
+    def __init__(self, reference_wav: Optional[Path] = None,
+                 language: str = "ru"):
+        self.reference_wav = reference_wav or _xtts_reference_wav()
+        self.language = language
+        self._proc: Optional[subprocess.Popen[bytes]] = None
+        self._lock = threading.Lock()
+
+    def available(self) -> bool:
+        if not _xtts_package_available():
+            return False
+        if self.reference_wav is None or not self.reference_wav.exists():
+            return False
+        return bool(_audio_player_cmd())
+
+    def voice_signature(self) -> str:
+        if self.reference_wav is None:
+            return "xtts:no-ref"
+        try:
+            return f"xtts:{self.reference_wav.name}:{self.reference_wav.stat().st_mtime_ns}"
+        except OSError:
+            return "xtts:no-ref"
+
+    def _get_model(self):
+        """Lazy-load модели. Возвращает TTS instance или None."""
+        global _XTTS_MODEL
+        with _XTTS_LOCK:
+            if _XTTS_MODEL is not None:
+                return _XTTS_MODEL
+            try:
+                from TTS.api import TTS as _TTSApi  # type: ignore  # noqa: WPS433
+            except Exception as e:  # noqa: BLE001
+                log.warning("XTTS: пакет TTS не загружается: %s", e)
+                return None
+            try:
+                log.info("XTTS: первая загрузка модели %s "
+                         "(может занять минуту)…", _XTTS_MODEL_NAME)
+                _XTTS_MODEL = _TTSApi(model_name=_XTTS_MODEL_NAME,
+                                       progress_bar=False, gpu=False)
+                log.info("XTTS: модель готова")
+                return _XTTS_MODEL
+            except Exception as e:  # noqa: BLE001
+                log.error("XTTS: не удалось загрузить модель: %s", e)
+                return None
+
+    def synthesize_wav(self, text: str, dest: Path) -> bool:
+        if self.reference_wav is None:
+            return False
+        model = self._get_model()
+        if model is None:
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".wav.part")
+        try:
+            with self._lock:
+                model.tts_to_file(
+                    text=text,
+                    speaker_wav=str(self.reference_wav),
+                    language=self.language,
+                    file_path=str(tmp),
+                )
+            if not tmp.exists() or tmp.stat().st_size < 100:
+                tmp.unlink(missing_ok=True)
+                return False
+            os.replace(tmp, dest)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("XTTS synthesize_wav: %s", e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+    def speak(self, text: str) -> None:
+        """Синхронный синтез + воспроизведение через временный WAV."""
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "out.wav"
+            if self.synthesize_wav(text, wav):
+                _play_wav(wav)
+
+    def stop(self) -> None:
+        return None
+
+
 class _EspeakEngine(_Engine):
     name = "espeak-ng"
 
@@ -316,15 +458,27 @@ def _play_wav(path: Path) -> None:
 def _select_engine(prefer: str = "auto",
                     piper_voice: Optional[str] = None) -> _Engine:
     """Выбирает доступный движок по приоритету.
-    prefer ∈ {auto, piper, espeak, off}.
-    piper_voice — имя голоса для piper, например 'ru_RU-dmitri-medium'."""
+    prefer ∈ {auto, xtts, piper, espeak, off}.
+    piper_voice — имя голоса для piper, например 'ru_RU-dmitri-medium'.
+
+    Auto-приоритет: xtts (если есть reference WAV + пакет) > piper > espeak.
+    Если prefer='xtts' но XTTS не готов — НЕ падаем, плавно скатываемся
+    дальше по списку.
+    """
     if prefer == "off":
         return _Engine()
-    if prefer != "espeak":
+    if prefer in ("auto", "xtts"):
+        xtts = _XTTSEngine()
+        if xtts.available():
+            return xtts
+        if prefer == "xtts":
+            log.warning("XTTS выбран, но недоступен (нет reference WAV "
+                        "или пакета TTS) — фоллбэк на piper/espeak")
+    if prefer in ("auto", "piper", "xtts"):
         piper = _PiperEngine(voice_name=piper_voice)
         if piper.available():
             return piper
-    if prefer != "piper":
+    if prefer in ("auto", "espeak", "piper", "xtts"):
         espeak = _EspeakEngine()
         if espeak.available():
             return espeak

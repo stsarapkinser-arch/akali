@@ -85,6 +85,10 @@ OPTIONAL_PIP_PACKAGES: list[tuple[str, str]] = [
     ("google.genai", "google-genai"),       # Gemini cloud путь
     ("piper", "piper-tts"),                  # piper Python wrapper
     ("ollama", "ollama"),                    # python-клиент для Ollama
+    # XTTS v2 (Coqui) — тяжёлый (~2 ГБ torch+модель). Опционален: пока
+    # пользователь не положит voices/jarvis_reference.wav, движок XTTS не
+    # активируется. Установка пакета не запускает загрузку модели.
+    ("TTS", "TTS"),
 ]
 
 
@@ -208,6 +212,11 @@ def _download(url: str, dest: Path, progress: Optional[ProgressFn] = None,
 
 # ── Проверки =============================================================
 
+# Пакеты, которые НЕ ставим автоматически (тяжёлые, нужны лишь по запросу).
+# Их можно поставить кнопкой «Установить недостающее».
+_HEAVY_PIP_PACKAGES = {"TTS"}
+
+
 def check_pip_package(import_name: str, pip_name: str,
                        required: bool = True) -> CheckResult:
     """Пытается импортнуть пакет; если нет — fixable=True (через pip).
@@ -221,11 +230,17 @@ def check_pip_package(import_name: str, pip_name: str,
         return CheckResult(f"pip: {pip_name}", True, "доступен",
                            fixable=False, auto_safe=False)
     except ImportError:
+        # Тяжёлые пакеты не ставим молча — это легко загнать пользователя в
+        # двухгигабайтную загрузку без его ведома.
+        is_heavy = pip_name in _HEAVY_PIP_PACKAGES
+        msg = f"{'обязательный' if required else 'опциональный'} пакет не установлен"
+        if is_heavy:
+            msg += " (тяжёлый — не ставится автоматически, кликни кнопку)"
         return CheckResult(
             f"pip: {pip_name}",
             False,
-            f"{'обязательный' if required else 'опциональный'} пакет не установлен",
-            fixable=True, auto_safe=True,
+            msg,
+            fixable=True, auto_safe=not is_heavy,
         )
     except Exception as e:  # noqa: BLE001
         # Например, OSError: PortAudio library not found.
@@ -320,6 +335,37 @@ def check_piper_voice() -> CheckResult:
         f"Piper голос ({PIPER_DEFAULT_VOICE})", False,
         f"не найден. Будет скачан {PIPER_DEFAULT_VOICE} (~60 МБ).",
         fixable=True, auto_safe=True,
+    )
+
+
+def check_xtts_reference() -> CheckResult:
+    """Информационная проверка XTTS reference WAV.
+
+    Не считается ошибкой если его нет — это опциональный артефакт,
+    который пользователь загружает руками. Просто показываем статус.
+    Если файл есть и пакет TTS установлен — клонированный голос Джарвиса
+    будет автоматически выбран как default движок.
+    """
+    wav = paths.XTTS_REFERENCE_WAV
+    if wav.exists() and wav.stat().st_size > 1000:
+        # Проверка пакета TTS отдельно — он в OPTIONAL_PIP_PACKAGES.
+        try:
+            importlib.import_module("TTS")
+            note = "пакет TTS установлен — XTTS готов к использованию"
+            return CheckResult("XTTS reference (voices/jarvis_reference.wav)",
+                                True, f"{wav.name} ({wav.stat().st_size // 1024} КБ), {note}",
+                                fixable=False, auto_safe=False)
+        except ImportError:
+            return CheckResult("XTTS reference (voices/jarvis_reference.wav)",
+                                False,
+                                f"{wav.name} есть, но пакет TTS не установлен. "
+                                "Кликни «Установить недостающее».",
+                                fixable=True, auto_safe=False)
+    return CheckResult(
+        "XTTS reference (voices/jarvis_reference.wav)", True,
+        "не загружен — XTTS выключен (опционально). "
+        "Положи WAV-сэмпл голоса для voice cloning.",
+        fixable=False, auto_safe=False,
     )
 
 
@@ -436,6 +482,8 @@ def run_all_checks(gemini_api_key: str | None = None) -> SystemReport:
     report.items.append(_safe(check_piper_binary, "Piper (бинарь)"))
     report.items.append(_safe(check_piper_voice,
                               f"Piper голос ({PIPER_DEFAULT_VOICE})"))
+    report.items.append(_safe(check_xtts_reference,
+                              "XTTS reference (voices/jarvis_reference.wav)"))
     report.items.append(_safe(check_espeak, "espeak-ng"))
     report.items.append(_safe(check_ollama_binary, "Ollama (бинарь)"))
     report.items.append(_safe(check_ollama_model,
@@ -447,25 +495,38 @@ def run_all_checks(gemini_api_key: str | None = None) -> SystemReport:
 
 
 def print_report(report: SystemReport) -> None:
-    """Печатает отчёт человеческим языком."""
+    """Печатает отчёт человеческим языком — с блочным разделением.
+
+    Использует log.section/step/success/warn_box helpers для цветного
+    вывода. Без TTY/NO_COLOR — обычные info-строки.
+    """
+    from . import log as _log_helpers  # noqa: WPS433 — отложенный импорт
     n_ok = sum(1 for it in report.items if it.ok)
     n_total = len(report.items)
-    log.info("─── Проверка: %d из %d компонентов на месте ───", n_ok, n_total)
+    _log_helpers.section(log,
+        f"Проверка компонентов: {n_ok}/{n_total} в порядке")
     for item in report.items:
-        prefix = "✓" if item.ok else ("⚠" if item.fixable else "✗")
-        log.info("  %s %s — %s", prefix, item.name, item.message)
+        if item.ok:
+            _log_helpers.step(log, "✓ %s — %s", item.name, item.message)
+        elif item.fixable:
+            _log_helpers.step(log, "⚠ %s — %s", item.name, item.message)
+        else:
+            _log_helpers.step(log, "✗ %s — %s", item.name, item.message)
     n_fix = report.fixable_count
     n_auto = report.auto_safe_count
     if n_fix:
         if n_auto == n_fix:
-            log.info("Можно поставить автоматически: %d штук(а).", n_fix)
+            _log_helpers.step(log,
+                "→ доставлю автоматически: %d штук(и)", n_fix)
         elif n_auto > 0:
-            log.info("Можно поставить автоматически %d из %d (остальные — "
-                     "поставь сам, sudo / большие скачивания).",
-                     n_auto, n_fix)
+            _log_helpers.step(log,
+                "→ автоматом: %d из %d (остальные — кнопкой/sudo)",
+                n_auto, n_fix)
         else:
-            log.info("Установка требует ручного вмешательства: %d штук(а).",
-                     n_fix)
+            _log_helpers.step(log,
+                "→ нужна ручная установка: %d штук(и)", n_fix)
+    elif n_ok == n_total:
+        _log_helpers.success(log, "Все компоненты на месте")
 
 
 # ── Установки (auto_safe=True) ==========================================

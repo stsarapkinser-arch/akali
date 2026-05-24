@@ -166,6 +166,7 @@ class GeminiClient:
         self._api_key = (api_key or _load_gemini_key_from_env() or "").strip() or None
         self.model = model
         self._client = None
+        self.last_error: str = ""        # последняя человеческая причина ошибки (для роутера)
         if not self._api_key:
             log.info("GeminiClient: API ключ не задан — облачный путь выключен")
 
@@ -188,6 +189,7 @@ class GeminiClient:
 
     def query(self, text: str) -> Optional[str]:
         if not self._api_key:
+            self.last_error = "ключ не задан"
             return None
         try:
             client = self._get_client()
@@ -200,7 +202,33 @@ class GeminiClient:
                     "max_output_tokens": 128,
                 },
             )
+            self.last_error = ""
             return _strip_fences(getattr(resp, "text", "") or "") or None
         except Exception as e:  # noqa: BLE001
+            self.last_error = _humanize_gemini_error(e)
             log.debug("Gemini query error: %s", e)
             return None
+
+
+def _humanize_gemini_error(exc: BaseException) -> str:
+    """Делает понятную короткую причину из ошибки Gemini SDK."""
+    msg = str(exc)
+    low = msg.lower()
+    if "failed_precondition" in low and "location" in low:
+        return "регион не поддерживается (нужен VPN)"
+    if "permission_denied" in low or "unauthenticated" in low or "401" in low or "403" in low:
+        return "API-ключ отвергнут (проверь права)"
+    if "resource_exhausted" in low or "429" in low or "rate limit" in low:
+        return "лимит запросов исчерпан"
+    if "deadline_exceeded" in low or "timeout" in low or "timed out" in low:
+        return "таймаут запроса"
+    if "unavailable" in low or "503" in low:
+        return "сервис временно недоступен"
+    if "invalid_argument" in low or "400" in low:
+        # цепляем смысл, не сырой стек
+        return f"некорректный запрос: {msg[:120]}"
+    if "name or service not known" in low or "dns" in low or "connection" in low:
+        return "сетевая ошибка"
+    name = type(exc).__name__
+    short = msg if len(msg) < 160 else msg[:160] + "…"
+    return f"{name}: {short}"

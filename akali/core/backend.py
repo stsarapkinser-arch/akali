@@ -131,12 +131,14 @@ class AssistantCore:
             auto_sources=dict(self.auto_sources),
         )
 
-    def init_router(self, gemini_api_key: Optional[str] = None) -> None:
+    def init_router(self, gemini_api_key: Optional[str] = None,
+                     llm_mode: str = "auto") -> None:
         """Создаёт QueryRouter (lazy — чтобы тесты могли не тащить fastembed)."""
         QueryRouter = _lazy_import_router()
         self._router = QueryRouter(
             cache_file=paths.QUERY_CACHE_JSON,
             gemini_api_key=gemini_api_key,
+            llm_mode=llm_mode,
         )
         if self.commands_db:
             self._router.load_db(self.commands_db, self.commands_file)
@@ -145,6 +147,13 @@ class AssistantCore:
         if self._router is not None:
             try:
                 self._router.set_gemini_key(api_key)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def update_llm_mode(self, mode: str) -> None:
+        if self._router is not None:
+            try:
+                self._router.set_llm_mode(mode)
             except Exception:  # noqa: BLE001
                 pass
 
