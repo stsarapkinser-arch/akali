@@ -19,7 +19,7 @@ jobs:
       - name: System deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y portaudio19-dev espeak-ng git
+          sudo apt-get install -y portaudio19-dev espeak-ng git libegl1 libxkbcommon0
 
       - name: Python deps
         run: pip install -r requirements-dev.txt
