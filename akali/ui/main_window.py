@@ -1,16 +1,12 @@
 """Главное окно ассистента — минималистичный экран с реактором.
 
 Архитектура:
-    • Нативный системный декор окна (KDE/GNOME/whatever DE рисует tit
-      lebar) — drag/minimize/maximize/close через WM, без кастомных
-      кнопок в шапке.
-    • Только одна страница — HomePage. Никаких вкладок «Команды» и
-      «Настройки» (управление вынесено в QSettings, обновление через
-      трей).
-    • Никакого status-row внизу.
+    • Нативный системный декор окна.
+    • HomePage — основной экран с реактором + кнопка для перехода
+      в SettingsPage.
+    • SettingsPage доступна через QStackedWidget, назад — через
+      кнопку «Назад».
     • Стиль `Cyber Arc` остаётся для самой страницы.
-
-Все логи идут через `logging` в stdout — UI-вкладки «Лог» нет.
 """
 from __future__ import annotations
 
@@ -20,12 +16,12 @@ from typing import Optional
 from PySide6.QtCore import QSettings, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QMainWindow, QMessageBox,
-                                QVBoxLayout, QWidget)
+                                QStackedWidget, QVBoxLayout, QWidget)
 
 from ..core.backend import AssistantCore
 from ..core.updater import UpdateResult
 from .icons import IconSet
-from .pages import HomePage
+from .pages import HomePage, SettingsPage
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +32,7 @@ WINDOW_MIN_HEIGHT = 680
 
 
 class MainWindow(QMainWindow):
-    """Главное окно: только HomePage. Без вкладок, без status row."""
+    """Главное окно: HomePage + SettingsPage через QStackedWidget."""
 
     # Команды от UI к координатору (большинство сигналов сохранены ради
     # совместимости с app.py, чтобы не править кучу connect'ов; часть
@@ -87,10 +83,35 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self.home_page = HomePage()
-        outer.addWidget(self.home_page, 1)
+        self._stack = QStackedWidget()
+        self._stack.setObjectName("pageStack")
 
+        self.home_page = HomePage()
+        self._stack.addWidget(self.home_page)  # index 0
+
+        self.settings_page = SettingsPage(
+            self._core, self._settings, self._repo_dir,
+        )
+        self._stack.addWidget(self.settings_page)  # index 1
+
+        outer.addWidget(self._stack, 1)
         self.setCentralWidget(central)
+
+        # Navigation
+        self.home_page.settings_clicked.connect(self._show_settings)
+        self.settings_page.back_clicked.connect(self._show_home)
+
+        # Forward settings signals
+        self.settings_page.update_requested.connect(self.update_requested)
+        self.settings_page.check_update_requested.connect(
+            self.check_update_requested)
+        self.settings_page.reload_requested.connect(self.reload_core_requested)
+
+    def _show_settings(self) -> None:
+        self._stack.setCurrentIndex(1)
+
+    def _show_home(self) -> None:
+        self._stack.setCurrentIndex(0)
 
     def set_minimize_to_tray(self, value: bool) -> None:
         self._minimize_to_tray = value

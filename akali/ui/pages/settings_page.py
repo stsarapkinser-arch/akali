@@ -241,6 +241,7 @@ def _form_row(label: str, widget: QWidget) -> QHBoxLayout:
 class SettingsPage(QWidget):
     """Все настройки в одной скроллируемой колонке."""
 
+    back_clicked = Signal()
     update_requested = Signal(bool)        # force
     check_update_requested = Signal()
     reload_requested = Signal()
@@ -267,9 +268,26 @@ class SettingsPage(QWidget):
         outer.setContentsMargins(14, 10, 14, 10)
         outer.setSpacing(8)
 
+        # -- Back button + title --
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
+        back_btn = QPushButton("←  Назад")
+        back_btn.setObjectName("backBtn")
+        back_btn.setCursor(Qt.PointingHandCursor)
+        back_btn.setFixedHeight(28)
+        back_btn.clicked.connect(self.back_clicked)
+        top_row.addWidget(back_btn)
+        top_row.addStretch(1)
         title = QLabel("Настройки")
         title.setObjectName("pageTitle")
-        outer.addWidget(title)
+        top_row.addWidget(title)
+        top_row.addStretch(1)
+        # Spacer to balance the back button width
+        spacer = QWidget()
+        spacer.setFixedWidth(back_btn.sizeHint().width())
+        top_row.addWidget(spacer)
+        outer.addLayout(top_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)

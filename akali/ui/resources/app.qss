@@ -200,6 +200,34 @@ QLabel#toastFrame {
     font-family: "JetBrains Mono", monospace;
 }
 
+/* === Settings gear button on HomePage === */
+QPushButton#settingsGearBtn {
+    background: transparent;
+    border: none;
+    padding: 4px;
+    border-radius: 4px;
+}
+QPushButton#settingsGearBtn:hover {
+    background-color: rgba(0, 212, 255, 0.12);
+}
+
+/* === Back button on SettingsPage === */
+QPushButton#backBtn {
+    background: transparent;
+    color: #00d4ff;
+    border: 1px solid rgba(0, 212, 255, 0.30);
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    padding: 4px 12px;
+    font-family: "JetBrains Mono", monospace;
+}
+QPushButton#backBtn:hover {
+    background-color: rgba(0, 212, 255, 0.12);
+    border-color: rgba(0, 212, 255, 0.55);
+}
+
 /* === Кнопки === */
 QPushButton#primaryBtn {
     background-color: rgba(0, 212, 255, 0.10);

@@ -1,9 +1,7 @@
-"""Главный (и единственный) экран ассистента: реактор + статус + тост.
+"""Главный экран ассистента: реактор + статус + тост.
 
 Раскладка:
     +---- 420 wide ----------------+
-    |      AKALI v0.3.0            |  branding (top)
-    |  ---- thin cyan line ----    |
     |      +--- reactor ---+       |
     |      |   320x320     |       |
     |      +---------------+       |
@@ -18,10 +16,10 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QPainter
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QSizePolicy,
-                                QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
+                                QSizePolicy, QVBoxLayout, QWidget)
 
-from ... import __version__
+from ..icons import IconSet
 from ..widgets import Reactor
 
 
@@ -119,9 +117,10 @@ class _ConfidenceBar(QWidget):
 class HomePage(QWidget):
     """Экран ассистента: реактор + большой статус + toast."""
 
-    start_clicked   = Signal()
-    stop_clicked    = Signal()
-    reindex_clicked = Signal()
+    start_clicked    = Signal()
+    stop_clicked     = Signal()
+    reindex_clicked  = Signal()
+    settings_clicked = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -135,21 +134,19 @@ class HomePage(QWidget):
         outer.setContentsMargins(16, 12, 16, 16)
         outer.setSpacing(0)
 
-        # -- Branding --
-        brand_row = QHBoxLayout()
-        brand_row.setContentsMargins(0, 0, 0, 0)
-        brand_row.addStretch(1)
-
-        self._brand = QLabel(f"AKALI  v{__version__}")
-        self._brand.setObjectName("homeBrand")
-        self._brand.setAlignment(Qt.AlignCenter)
-        brand_row.addWidget(self._brand)
-        brand_row.addStretch(1)
-        outer.addLayout(brand_row)
-
-        outer.addSpacing(6)
-        outer.addWidget(_ThinSeparator())
-        outer.addSpacing(4)
+        # -- Settings gear (top-right) --
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.addStretch(1)
+        self._settings_btn = QPushButton()
+        self._settings_btn.setObjectName("settingsGearBtn")
+        self._settings_btn.setIcon(IconSet.settings())
+        self._settings_btn.setFixedSize(32, 32)
+        self._settings_btn.setCursor(Qt.PointingHandCursor)
+        self._settings_btn.setToolTip("Настройки")
+        self._settings_btn.clicked.connect(self.settings_clicked)
+        top_row.addWidget(self._settings_btn)
+        outer.addLayout(top_row)
 
         outer.addStretch(1)
 
